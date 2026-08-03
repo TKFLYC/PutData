@@ -1,0 +1,71 @@
+NimoShake 監控告警 — OPAPP 環境 (2026/07/31 v3)
+==========================================================
+
+本包為 OPAPP 專用，不含任何金鑰。
+發信人固定 picappservice@pic.net.tw，收件人於 conf 設定。
+
+本版更新 (v3)
+-------------
+- 報表新增「全量進度%與預計剩餘時間」: conf 設 TABLE_TOTALS 基準即顯示 (可用 --totals 從上次全量 log 一鍵產生)
+- 報表 [7] 抓取 NimoShake 內建監控 API 內容 (原廠同步進度與統計)
+- 報表新增「增量同步狀態」: 事件速率 / 同步延遲 / 活躍 table (全量完成後仍看得到現況)
+- 程序偵測相容 nimo-shake.linux 執行檔名 (舊版會誤報「未運行」)
+- panic 偵測收緊為 "panic:"，避免誤中增量事件資料裡隨機出現的字樣而誤發告警
+- 排程鎖檔改放 state/ (避免 /tmp 跨帳號殘留鎖檔造成 Permission denied)
+- (選用) 現況報表排程: 每 5 分鐘寫 state/report.txt，非 root 帳號可免 sudo 查看 (預設不裝)
+- 監控報表可不帶參數執行 (自動讀 conf 的 LOG_FILE)，也可帶 conf 或 log 路徑
+
+結構
+----
+部署說明.txt                          本檔
+交付文件-NimoShake監控與告警.docx      完整技術文件 (功能/告警/參數/部署/驗證/常見問題排查)
+信件範本-告警通知樣式說明.docx        信件樣式與實際收信畫面
+opapp-monitor/                       程式碼資料夾 — 整個資料夾上傳主機即可
+├── nimoshake-monitor.sh              監控解析器 (報表/--json/--summary，只讀不寄信)
+├── nimoshake-alert.sh                告警引擎 (狀態機+去重+補送+寄信)
+├── common.sh                         共用函式
+├── demo-alert-flow.sh                驗收演示
+├── opapp.conf.example               設定範本
+└── crontab.example                   排程範例 (告警每分鐘 + 現況報表每 5 分鐘)
+
+部署四步驟
+----------
+1. 把 opapp-monitor/ 整個上傳主機 (建議 /opt/starco/opapp-monitor)，建立設定:
+     cd /opt/starco/opapp-monitor
+     cp opapp.conf.example opapp.conf && chmod 600 opapp.conf
+   必改三項: LOG_FILE (實際 log 路徑)、SENDGRID_API_KEY (金鑰)、HOST_ROLE (測試機/正式機)
+   ※ 執行檔若非 nimo-shake / nimo-shake.linux 命名，另需調整 PROC_PATTERN
+
+2. 驗證讀得到 log (不寄信):
+     head -c 100 /var/log/nimoshake/opapp/nimo-shake.log   # Permission denied = 帳號沒讀取權，見下方【重要】
+     bash nimoshake-monitor.sh                 # 不帶參數，自動用 opapp.conf 的 LOG_FILE
+     bash nimoshake-alert.sh --status opapp.conf
+   ※ 若 head 顯示 Permission denied (NimoShake 由 root 啟動時的正常現象)，
+     上面的手動指令請一律加 sudo 執行 (sudo bash ...)，排程也必須裝 root (見步驟 3)。
+     日常看即時狀態: sudo bash nimoshake-monitor.sh (不用帶參數)。
+
+3. 裝排程: 參考 crontab.example (crontab -e 貼入，BASE 改成實際路徑)。
+   【重要】排程要裝在「讀得到 NimoShake log 的帳號」下:
+   NimoShake 若由 root 啟動，log 權限通常是 640，其他帳號讀不到，
+   監控會一直誤報 LOG_MISSING → 此時請用 sudo crontab -e 裝在 root 底下。
+   執行期狀態自動寫入程式資料夾內的 state/。
+   (選用) 要讓非 root 帳號免 sudo 看現況，可啟用 crontab.example 內註解的報表排程。
+
+4. 預設 DRY_RUN=1 只寫 state/alert.log 不寄信，觀察數日確認判斷正確後，
+   把 opapp.conf 的 DRY_RUN 改 0 正式啟用。
+
+部署後自我檢查
+--------------
+- state/alert.log 的「首次執行，建立 log 基準點」只該出現一次且 offset 為實際檔案大小；
+  若每分鐘重複出現且 offset=0 → LOG_FILE 讀不到 (路徑或權限問題)，
+  排查步驟見 交付文件 3.4「常見部署問題排查」。
+- sudo bash nimoshake-monitor.sh 應能看到完整報表 (增量期看 [2] 的事件速率與同步延遲；
+  全量期看 [3] 的進度%)。若有啟用選用報表排程，亦可 cat state/report.txt。
+
+驗收演示 (選用)
+---------------
+bash demo-alert-flow.sh opapp.conf          # dry-run 彩排
+bash demo-alert-flow.sh --send opapp.conf   # 真實寄信: 新增/持續/log遺失/解除 四封
+(演示 log 來源用 DEMO_SOURCE_LOG=/path/to/real.log 指定；不會動正式 state)
+
+環境需求: Linux，bash + awk + grep + curl (+ flock)，無其他套件。
