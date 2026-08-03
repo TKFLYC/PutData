@@ -1,0 +1,58 @@
+# =============================================================================
+# 賣貨便 (7-ELEVEN MyShip) 環境設定範本 — 複製成 ../MyShip/myship.conf 後填實際值
+#   cp config/myship.conf.example MyShip/myship.conf
+# 注意: 真實 .conf 已被 .gitignore 排除，不會進版控。
+# 部署後請確認:
+#   1. LOG_FILE          = NimoShake 這台主機實際的 log 路徑
+#   2. SENDGRID_API_KEY  = 填入實際金鑰
+#   3. HOST_ROLE         = 測試機 / 正式機
+# =============================================================================
+ENV_NAME="MyShip"            # 環境代號，顯示在信件主旨與記錄 (賣貨便)
+HOST_ROLE="測試機"           # 顯示在信件主旨: 【StarCo MyShip·測試機】；正式環境改 "正式機"
+
+# NimoShake log 路徑 (請改成主機實際位置)
+LOG_FILE="/var/log/nimoshake/myship/nimo-shake.log"
+
+# ---- SendGrid 連線參數 ----
+SENDGRID_API_KEY="SG.xxxxxxxx"             # << 換新金鑰改這行即可
+# SENDGRID_API_KEY_FILE="/path/to/key.txt"  # 或改用外部金鑰檔 (與上行擇一)
+SENDGRID_API_HOST="api.sendgrid.com"       # API 模式 (程式使用，走 443)
+SENDGRID_API_PORT="443"
+SENDGRID_SMTP_SERVER="smtp.sendgrid.net"   # SMTP 資訊僅作紀錄備查 (587 TLS / 465 SSL)
+SENDGRID_SMTP_PORT="587"                   # 目前程式僅走 API，未實作 SMTP 切換
+SENDGRID_SMTP_USERNAME="apikey"            # SMTP 帳號固定為 apikey，密碼即上方 API Key
+
+# ---- 發信人 / 收件人 ----
+MAIL_FROM="c2cteam@pic.net.tw"             # 賣貨便發信信箱
+MAIL_FROM_NAME="StarCo Monitor (MyShip)"
+MAIL_TO="tony.zhang@stockfeel.com.tw"      # 可多個收件人，逗號分隔，例: "a@x.com,b@y.com"
+
+# ---- 告警行為 ----
+DRY_RUN=1                 # << 安全預設: 1=只寫 log 不寄信。觀察無誤後才改 0 才會真的寄
+ALERT_MIN_SEVERITY=medium # 低於此嚴重度只記錄不寄信 (high>medium>low>info)
+                          # 注意: low 級 (慢寫入/慢讀取) 在預設 medium 下不寄信，要收改 low
+REALERT_INTERVAL=21600    # 未解除問題每 6 小時提醒一次 (秒；0=不重複提醒)
+GLOBAL_COOLDOWN=60        # 任兩封信最小間隔 (秒)
+MAX_MAILS_PER_RUN=10      # 單次執行寄信上限
+NOTIFY_RESOLVED=1         # 問題恢復時寄「已解除」通知 (0=不寄)
+
+# ---- 監控門檻 ----
+EXPECT_RUNNING=0          # 1=程序必須常駐，找不到就告警；0=自動判斷 (只在全量未完成即中止時告警)
+STALL_SECONDS=300         # log 停滯幾秒視為異常 (程序不在時)
+HANG_SECONDS=60           # 程序在但 log 停寫幾秒視為疑似假死
+SLOW_WRITE_MS=200         # 慢寫入門檻 (毫秒，目標 MongoDB)
+SLOW_SCAN_MS=500          # 慢讀取門檻 (毫秒，來源 DynamoDB)
+SCAN_TAIL_LINES=2000      # 效能取樣行數 (log 尾端)
+PROC_PATTERN="(^|/)nimo-shake(\.(linux|darwin))?( |$)"  # pgrep -f 用的錨定 regex；相容 nimo-shake.linux 檔名，避免誤中 log 路徑/監控腳本自身
+
+# ---- 全量進度基準 (選填) ----
+# 設定各 table 來源總筆數後，報表 [3] 會顯示 進度% 與 預計剩餘時間。
+# 基準值可由「上次完成的全量 log」一鍵產生:  bash nimoshake-monitor.sh --totals /path/to/舊全量log
+# TABLE_TOTALS="Orders:5200000,Users:130000"
+
+# ---- 系統資源判讀門檻 (附在告警信的「系統狀態判讀」表) ----
+DISK_ALERT_PCT=85         # 磁碟使用率超過此 % 判為異常
+MEM_ALERT_PCT=90          # 記憶體使用率超過此 % 判為異常
+
+# STATE_DIR 預設為本 conf 所在目錄下的 state/，一般不需設定
+# STATE_DIR="/opt/starco/monitor/MyShip/state"

@@ -1,0 +1,14 @@
+# 賣貨便 (MyShip) 告警排程 (crontab -e 貼入，BASE 改成實際部署位置)
+# 【重要】排程要裝在「讀得到 NimoShake log 的帳號」下:
+#   NimoShake 若由 root 啟動，log 權限通常是 640，其他帳號讀不到，
+#   監控會一直誤報 LOG_MISSING → 請用 `sudo crontab -e` 裝在 root 底下。
+#   (判斷: 用排程帳號 head <log檔>，Permission denied 就是讀不到)
+BASE=/opt/starco/myship-monitor
+
+# 告警引擎: 每分鐘一次 (鎖檔放 state/，避免 /tmp 跨帳號殘留鎖檔造成 Permission denied)
+* * * * * flock -n $BASE/state/alert.lock /bin/bash $BASE/nimoshake-alert.sh $BASE/myship.conf >> $BASE/state/cron.log 2>&1
+
+# (選用) 現況報表: 每 5 分鐘寫入 state/report.txt，非 root 帳號可免 sudo cat 查看。
+# 告警與查看職責分離——預設不裝；需要時取消下行註解即可。
+
+# */5 * * * * /bin/bash $BASE/nimoshake-monitor.sh $BASE/myship.conf > $BASE/state/report.txt 2>&1
