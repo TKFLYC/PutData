@@ -1,12 +1,19 @@
-# 賣貨便 (MyShip) 告警排程 (crontab -e 貼入，BASE 改成實際部署位置)
-# 【重要】排程要裝在「讀得到 NimoShake log 的帳號」下:
-#   NimoShake 若由 root 啟動，log 權限通常是 640，其他帳號讀不到，
-#   監控會一直誤報 LOG_MISSING → 請用 `sudo crontab -e` 裝在 root 底下。
-#   (判斷: 用排程帳號 head <log檔>，Permission denied 就是讀不到)
+# 賣貨便 (MyShip) 告警排程 (`sudo crontab -e` 貼入)
+# 【重要】排程一律用 sudo 裝在 root 底下 (sudo crontab -e):
+#   NimoShake 由 root 啟動時 log 權限通常是 640，一般帳號讀不到，
+#   排程裝一般帳號會一直誤報 LOG_MISSING (實際部署已踩過此坑)。
+#   (驗證: 用排程帳號 head <log檔>，Permission denied 就是讀不到；
+#    裝好後用 `sudo crontab -l` 確認內容存在)
+# BASE = 在 myship-monitor 資料夾 (ls 看得到 nimoshake-alert.sh) 執行 pwd 印出來的路徑
 BASE=/opt/starco/myship-monitor
 
 # 告警引擎: 每分鐘一次 (鎖檔放 state/，避免 /tmp 跨帳號殘留鎖檔造成 Permission denied)
 * * * * * flock -n $BASE/state/alert.lock /bin/bash $BASE/nimoshake-alert.sh $BASE/myship.conf >> $BASE/state/cron.log 2>&1
+
+# 看門狗: 每 5 分鐘檢查「告警引擎本身」的心跳 (state/.heartbeat)。
+# 引擎壞掉/conf 改壞 = 無聲失明，這行會發「🔴 監控引擎停擺」信；恢復發 🟢。
+# 看門狗完全獨立不共用引擎程式碼，引擎掛掉不影響它寄信。
+*/5 * * * * /bin/bash $BASE/nimoshake-watchdog.sh $BASE/myship.conf >> $BASE/state/watchdog.log 2>&1
 
 # (選用) 現況報表: 每 5 分鐘寫入 state/report.txt，非 root 帳號可免 sudo cat 查看。
 # 告警與查看職責分離——預設不裝；需要時取消下行註解即可。

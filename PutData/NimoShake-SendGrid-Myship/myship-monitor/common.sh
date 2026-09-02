@@ -62,6 +62,19 @@ load_config() {
   EXPECT_RUNNING="${EXPECT_RUNNING:-${NS_EXPECT_RUNNING:-0}}"
   PROC_PATTERN="${PROC_PATTERN:-${NS_PROC_PATTERN:-(^|/)nimo-shake(\.(linux|darwin))?( |$)}}"
   TABLE_TOTALS="${TABLE_TOTALS:-}"   # 選填: 各 table 來源總筆數基準 "Orders:5200000,..."，報表顯示全量進度%
+
+  # FullCheck 結束通知 (選填): 填 nimo-full-check 的執行目錄 (可逗號分隔多個)。
+  # 設定後 alert 引擎會偵測「輸出資料夾出現 run-manifest.json」= 該次複核已結束，
+  # 自動寄結果信 (outcome/各 table 統計/耗時)。空值 = 功能關閉，不影響既有部署。
+  # 另以 FULLCHECK_PROC_PATTERN 追蹤 fullcheck 程序: 程序消失卻沒有新結果檔
+  # (中途被 OOM/kill/斷線終止) 時發 🔴 異常結束告警，失敗也不漏通知。
+  FULLCHECK_DIR="${FULLCHECK_DIR:-}"
+  FULLCHECK_PROC_PATTERN="${FULLCHECK_PROC_PATTERN:-(^|/)nimo-full-check(\.(linux|darwin))?( |$)}"
+  # 版本模式: starco=專版 (判別 run-manifest.json)；native=原生 git 版——
+  # 原生不寫 manifest，改用「程序結束 + 讀 -d 輸出資料夾的 diff 檔」判別，
+  # 此時 FULLCHECK_DIR 請直接填 -d 輸出資料夾本身。
+  FULLCHECK_MODE="${FULLCHECK_MODE:-starco}"
+  FULLCHECK_NATIVE_LOG="${FULLCHECK_NATIVE_LOG:-}"   # (建議) 原生 fullcheck 啟動時導出的 log 檔，用於區分跑完/中途掛掉
   return 0
 }
 

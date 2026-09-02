@@ -1,19 +1,45 @@
-NimoShake 監控告警 — 賣貨便 (MyShip) 環境 (2026/07/31 v3)
+NimoShake 監控告警 — 賣貨便 (MyShip) 環境 (2026/08/31 v4.2)
 ==========================================================
 
 本包為 賣貨便 (MyShip) 專用，不含任何金鑰。
 發信人固定 c2cteam@pic.net.tw，收件人於 conf 設定。
 
-本版更新 (v3)
+本版更新 (v4.2)
 -------------
-- 報表新增「全量進度%與預計剩餘時間」: conf 設 TABLE_TOTALS 基準即顯示 (可用 --totals 從上次全量 log 一鍵產生)
-- 報表 [7] 抓取 NimoShake 內建監控 API 內容 (原廠同步進度與統計)
-- 報表新增「增量同步狀態」: 事件速率 / 同步延遲 / 活躍 table (全量完成後仍看得到現況)
-- 程序偵測相容 nimo-shake.linux 執行檔名 (舊版會誤報「未運行」)
-- panic 偵測收緊為 "panic:"，避免誤中增量事件資料裡隨機出現的字樣而誤發告警
-- 排程鎖檔改放 state/ (避免 /tmp 跨帳號殘留鎖檔造成 Permission denied)
-- (選用) 現況報表排程: 每 5 分鐘寫 state/report.txt，非 root 帳號可免 sudo 查看 (預設不裝)
-- 監控報表可不帶參數執行 (自動讀 conf 的 LOG_FILE)，也可帶 conf 或 log 路徑
+- 新增「FullCheck 結束通知」: 在 conf 加一行 FULLCHECK_DIR (nimo-full-check.linux 的執行目錄) 後，
+  nimo-full-check 全量複核照原本指令跑完 (輸出資料夾出現 run-manifest.json) 1 分鐘內自動寄結果信:
+  🟢 PASS / 🟠 PASS_WITH_EXCEPTIONS / 🔴 FAIL + 各 table 統計 (checked/passed/failed/exceptions) +
+  異常欄位 Top 5 + 耗時。同一次結果只通知一次 (重跑後舊輸出資料夾被改名加時間戳也不會誤寄)；
+  首次啟用只建基準、不補寄歷史結果。範例見 myship.conf.example 的 FULLCHECK_DIR 區塊。
+- FullCheck 失敗也會通知: 同時追蹤 fullcheck 程序，程序消失卻沒有新結果檔
+  (OOM/kill/連線中斷/磁碟滿) → 寄 🔴「FullCheck 異常結束」告警，附排查步驟；
+  判斷前保留約 1 分鐘寬限，避免程序剛結束、結果檔還在寫的誤報。
+- 新增「看門狗」(nimoshake-watchdog.sh): 監控「告警引擎本身」——引擎每輪跑完寫心跳，
+  看門狗每 5 分鐘獨立檢查，心跳停更 5 分鐘即寄 🔴「監控引擎停擺 (告警失效中)」、
+  恢復寄 🟢。看門狗完全不共用引擎程式碼，引擎壞掉仍能寄信。
+  排程行已加入 crontab.example，照步驟 3 貼入即自動生效。
+- 原生版 fullcheck (不寫 run-manifest.json 的 git 版) 也支援: conf 設
+  FULLCHECK_MODE="native"、FULLCHECK_DIR 直接填 -d 輸出資料夾本身，
+  並建議設 FULLCHECK_NATIVE_LOG=<啟動時導出的log檔> 以區分跑完/中途掛掉。
+  原生版信件為「未發現差異 / 發現 N 筆差異+內容節錄」(原生不輸出統計數字)。
+- 升級方式: 覆蓋腳本檔即可，既有 conf 不用改 (未設 FULLCHECK_DIR 時行為與前版完全相同)。
+
+前版更新 (v4.1)
+-------------
+- 步驟 3 裝排程改為: 在 myship-monitor 資料夾 (ls 看得到 nimoshake-alert.sh) 執行 pwd，把結果填進 BASE=。
+
+前版更新 (v4)
+-------------
+- 監控報表「持續刷新模式」: 互動終端機直接執行 sudo bash nimoshake-monitor.sh (不帶參數)
+  啟動後畫面自動持續更新 (預設每 10 秒重新解析重印，Ctrl-C 結束)，不用重複下指令；
+  輸出導向檔案/管線 (如排程報表) 仍為單次報表，既有排程不受影響；互動下要單次可加 --human
+- 排程安裝一律 sudo crontab -e 裝在 root 底下 (crontab.example 已同步更新)
+- 補充 state/alert.log 訊息前綴判讀: INFO=純記錄(無寄信動作) / OK=本輪無需寄信 /
+  DONE=本輪實際有寄信 (dry_run=1 時為彩排記錄) / WARN=警告需人工留意
+- 設定檔格式不變: 既有 conf 不用改，覆蓋腳本檔即完成升級
+
+前版更新 (v3): 全量進度%/預計剩餘、內建監控 API 抓取、增量同步狀態、
+nimo-shake.linux 相容、panic 偵測收緊、鎖檔改放 state/、選用報表排程、免參數執行
 
 結構
 ----
@@ -23,6 +49,7 @@ NimoShake 監控告警 — 賣貨便 (MyShip) 環境 (2026/07/31 v3)
 myship-monitor/                       程式碼資料夾 — 整個資料夾上傳主機即可
 ├── nimoshake-monitor.sh              監控解析器 (報表/--json/--summary，只讀不寄信)
 ├── nimoshake-alert.sh                告警引擎 (狀態機+去重+補送+寄信)
+├── nimoshake-watchdog.sh             看門狗 (監控告警引擎本身，獨立程式)
 ├── common.sh                         共用函式
 ├── demo-alert-flow.sh                驗收演示
 ├── myship.conf.example               設定範本
@@ -42,12 +69,16 @@ myship-monitor/                       程式碼資料夾 — 整個資料夾上�
      bash nimoshake-alert.sh --status myship.conf
    ※ 若 head 顯示 Permission denied (NimoShake 由 root 啟動時的正常現象)，
      上面的手動指令請一律加 sudo 執行 (sudo bash ...)，排程也必須裝 root (見步驟 3)。
-     日常看即時狀態: sudo bash nimoshake-monitor.sh (不用帶參數)。
+     日常看即時狀態: sudo bash nimoshake-monitor.sh (不用帶參數)，
+     啟動後畫面會自動持續刷新 (每 10 秒)，Ctrl-C 結束；要單次報表加 --human。
 
-3. 裝排程: 參考 crontab.example (crontab -e 貼入，BASE 改成實際路徑)。
-   【重要】排程要裝在「讀得到 NimoShake log 的帳號」下:
-   NimoShake 若由 root 啟動，log 權限通常是 640，其他帳號讀不到，
-   監控會一直誤報 LOG_MISSING → 此時請用 sudo crontab -e 裝在 root 底下。
+3. 裝排程: cd 到步驟 1 上傳的 myship-monitor 資料夾，先 ls 確認看得到 nimoshake-alert.sh 和 myship.conf，
+   再執行 pwd，把印出來的路徑填進 crontab.example 的 BASE=，然後 sudo crontab -e 貼入。
+   確認: 1 分鐘後 sudo cat state/alert.log 應有紀錄。
+   【重要】排程一律用 sudo crontab -e 裝在 root 底下:
+   NimoShake 由 root 啟動時 log 權限通常是 640，一般帳號讀不到，
+   排程裝一般帳號會一直誤報 LOG_MISSING (實際部署已踩過此坑)；
+   裝好後用 sudo crontab -l 確認內容存在。
    執行期狀態自動寫入程式資料夾內的 state/。
    (選用) 要讓非 root 帳號免 sudo 看現況，可啟用 crontab.example 內註解的報表排程。
 
@@ -59,8 +90,11 @@ myship-monitor/                       程式碼資料夾 — 整個資料夾上�
 - state/alert.log 的「首次執行，建立 log 基準點」只該出現一次且 offset 為實際檔案大小；
   若每分鐘重複出現且 offset=0 → LOG_FILE 讀不到 (路徑或權限問題)，
   排查步驟見 交付文件 3.4「常見部署問題排查」。
-- sudo bash nimoshake-monitor.sh 應能看到完整報表 (增量期看 [2] 的事件速率與同步延遲；
-  全量期看 [3] 的進度%)。若有啟用選用報表排程，亦可 cat state/report.txt。
+- state/alert.log 前綴判讀: INFO=純記錄 (無寄信動作)、OK=本輪無需寄信、
+  DONE=本輪實際有寄信 (dry_run=1 時為彩排記錄，未真的寄)、WARN=警告需人工留意。
+- sudo bash nimoshake-monitor.sh 應能看到完整報表並持續刷新 (Ctrl-C 結束；
+  增量期看 [2] 的事件速率與同步延遲；全量期看 [3] 的進度%)。
+  若有啟用選用報表排程，亦可 cat state/report.txt。
 
 驗收演示 (選用)
 ---------------

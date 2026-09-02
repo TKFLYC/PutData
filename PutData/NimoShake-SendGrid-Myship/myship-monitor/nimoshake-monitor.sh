@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# nimoshake-monitor.sh  v2.3  — NimoShake (DynamoDB -> MongoDB) 監控解析器
+# nimoshake-monitor.sh  v2.4  — NimoShake (DynamoDB -> MongoDB) 監控解析器
 # -----------------------------------------------------------------------------
 # 專案 : StarCo Migration (C2CPlatform)  環境: OPAPP / 賣貨便(MyShip)
 # 依賴 : 純 bash + awk + grep + (可選) curl / pgrep / ps  — 無外部套件
@@ -14,12 +14,15 @@
 #
 # 用法 (目標可為 log 檔、conf 檔、或留空):
 #   ./nimoshake-monitor.sh                        # 不帶參數: 自動找腳本旁唯一的 *.conf，用其 LOG_FILE
+#                                                 #   在互動終端機直接執行時自動進入持續刷新 (同 --watch)，
+#                                                 #   Ctrl-C 結束；輸出導向檔案/管線時仍為單次報表
 #   ./nimoshake-monitor.sh <env.conf>             # 指定 conf: 讀其 LOG_FILE 與門檻參數
 #   ./nimoshake-monitor.sh <logfile>              # 直接指定 log 檔 (臨時分析任何 log)
+#   ./nimoshake-monitor.sh --human [目標]         # 強制單次報表 (不進入持續刷新)
 #   ./nimoshake-monitor.sh --json [目標]          # JSON 輸出 (串接 dashboard)
 #   ./nimoshake-monitor.sh --conditions [目標]    # 給告警引擎用的條件清單
 #   ./nimoshake-monitor.sh --summary [目標]       # 逐面向判讀 (告警信的判讀表來源)
-#   ./nimoshake-monitor.sh --watch [秒] [目標]    # 持續刷新 (預設 10 秒)
+#   ./nimoshake-monitor.sh --watch [秒] [目標]    # 持續刷新 (預設 10 秒，Ctrl-C 結束)
 #   ./nimoshake-monitor.sh --totals <全量log> [log2...] # 統計各 table 實際筆數，產生 TABLE_TOTALS
 #                                                 # (全量若跨輪替檔，把 .log.2 .log.1 一起帶上)
 #
@@ -50,16 +53,16 @@ HTTP_INCR_PORT="${NS_HTTP_INCR_PORT:-9340}"
 HTTP_PPROF_PORT="${NS_HTTP_PPROF_PORT:-9330}"
 TABLE_TOTALS="${NS_TABLE_TOTALS:-${TABLE_TOTALS:-}}"   # 選填: "Orders:5200000,Users:130000" → [3] 顯示進度%/預計剩餘
 
-MODE="human"; WATCH_INTERVAL=10; LOGFILE=""; CONF_PATH=""; TARGETS=()
+MODE="human"; MODE_EXPLICIT=0; WATCH_INTERVAL=10; LOGFILE=""; CONF_PATH=""; TARGETS=()
 while [ $# -gt 0 ]; do
   case "$1" in
-    --json)       MODE="json" ;;
-    --conditions) MODE="conditions" ;;
-    --summary)    MODE="summary" ;;
-    --totals)     MODE="totals" ;;
-    --human)      MODE="human" ;;
+    --json)       MODE="json";       MODE_EXPLICIT=1 ;;
+    --conditions) MODE="conditions"; MODE_EXPLICIT=1 ;;
+    --summary)    MODE="summary";    MODE_EXPLICIT=1 ;;
+    --totals)     MODE="totals";     MODE_EXPLICIT=1 ;;
+    --human)      MODE="human";      MODE_EXPLICIT=1 ;;
     --watch)
-      MODE="watch"
+      MODE="watch"; MODE_EXPLICIT=1
       if [ "${2:-}" ] && printf '%s' "${2:-}" | grep -qE '^[0-9]+$'; then WATCH_INTERVAL="$2"; shift; fi ;;
     -h|--help) grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*) echo "未知參數: $1" >&2; exit 2 ;;
@@ -67,6 +70,9 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+# 互動終端機直接執行且未指定模式 → 自動進入持續刷新 (啟動後一直更新，不用重複下指令)
+# 輸出導向檔案/管線 (如排程的 report.txt) 時 stdout 不是 TTY，維持單次報表不受影響
+if [ "$MODE_EXPLICIT" -eq 0 ] && [ -t 1 ]; then MODE="watch"; fi
 
 # ---- --totals: 統計各 table 實際筆數 (可接多個 log，全量跨輪替檔時一起給) ----
 if [ "$MODE" = "totals" ]; then
@@ -621,5 +627,13 @@ case "$MODE" in
   human)      print_human ;;
   watch)      # 每輪重新執行本腳本重算，才是真的刷新 (變數在頂部只算一次，直接重印會是舊值)
               # 目標帶 conf 原路徑 (若有)，讓 TABLE_TOTALS/門檻/port 等 conf 設定每輪重新套用
-              while true; do clear 2>/dev/null || true; bash "$0" --human "${CONF_PATH:-$LOGFILE}"; echo "(每 ${WATCH_INTERVAL}s 刷新，Ctrl-C 結束)"; sleep "$WATCH_INTERVAL"; done ;;
+              # trap: Ctrl-C / kill 時收乾淨地離開，不留半張報表；sleep 放背景 + wait 讓訊號即時生效
+              trap 'printf "\n(監控結束)\n"; exit 0' INT TERM
+              while true; do
+                _out=$(bash "$0" --human "${CONF_PATH:-$LOGFILE}" 2>&1)   # 先在背後算完，再一次清屏重印，畫面不閃爍
+                clear 2>/dev/null || printf '\033[2J\033[H'
+                printf '%s\n' "$_out"
+                echo "(每 ${WATCH_INTERVAL}s 刷新，Ctrl-C 結束；要單次報表請加 --human)"
+                sleep "$WATCH_INTERVAL" & wait $! || true
+              done ;;
 esac

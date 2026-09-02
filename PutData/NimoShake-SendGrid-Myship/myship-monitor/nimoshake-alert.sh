@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# nimoshake-alert.sh  v1.3 — NimoShake 監控告警引擎 (SendGrid)
+# nimoshake-alert.sh  v1.4 — NimoShake 監控告警引擎 (SendGrid)
 # -----------------------------------------------------------------------------
 # 設計給「每分鐘一次 cron」使用，重點在「不亂寄、不重複寄」:
 #   1. 狀態機:  新增(NEW) / 未解除(FIRING) / 已解除(RESOLVED)
@@ -11,6 +11,9 @@
 #   4. 冷卻/上限: 任兩封信最小間隔 GLOBAL_COOLDOWN，單次最多 MAX_MAILS_PER_RUN。
 #   5. 嚴重度門檻: 低於 ALERT_MIN_SEVERITY 的條件只記錄、不寄信。
 #   6. DRY_RUN=1 (預設) 只寫 log 不真的寄信 —— 上線前請確認後才改 0。
+#   7. FullCheck 完成通知 (v1.4): conf 設 FULLCHECK_DIR 後，nimo-full-check
+#      跑完 (輸出資料夾出現 run-manifest.json) 自動寄結果信；使用者照原本
+#      指令跑 fullcheck，不需改任何操作。
 #
 # 用法:
 #   ./nimoshake-alert.sh <env.conf>
@@ -274,6 +277,370 @@ if [ -d "$COND_DIR" ]; then
   done
 fi
 
+# ---- FullCheck 完成偵測 (conf 設 FULLCHECK_DIR 才啟用) -----------------------
+# 需求: nimo-full-check 全量複核一跑數小時，結束後要用 SendGrid 通知結果。
+# 判別: 專版 fullcheck「結束時」才會在輸出資料夾 (-d) 寫 run-manifest.json
+#       (含 outcome/started_at/finished_at)，所以 manifest 出現 = 該次已結束。
+#       使用者照原本指令跑 fullcheck 即可，不需改任何操作。
+# 去重: 指紋 = finished_at|outcome 記在 state/.fullcheck_seen。刻意不用路徑當
+#       指紋: fullcheck 重跑時會把舊輸出資料夾改名加時間戳，用路徑會誤判成
+#       新結果而重寄。寄成功才記錄 (寄失敗/被冷卻擋下 → 下一輪重試，不漏寄)。
+# 冷啟動: 首次啟用只把現有結果記為基準、不補寄歷史 (同 log offset 精神)。
+FC_SEEN_FILE="$STATE_DIR/.fullcheck_seen"
+FC_IDS=(); FC_SUBJECTS=(); FC_BODIES=(); FC_HTMLS=()
+
+# 單行 JSON 取欄位 (機器上未必有 jq，用 sed 解析 fullcheck 的 summary 行)
+fc_field_num() { printf '%s' "$1" | sed -n 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*\(-\{0,1\}[0-9][0-9]*\).*/\1/p' | head -1; }
+fc_field_str() { printf '%s' "$1" | sed -n 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1; }
+# manifest (多行 JSON) 取字串欄位: 頂層 outcome 在 tables 陣列之後，取最後一個
+fc_manifest_str() { grep -o '"'"$2"'"[[:space:]]*:[[:space:]]*"[^"]*"' "$1" 2>/dev/null | tail -1 | sed 's/.*"\([^"]*\)"$/\1/'; }
+
+fc_build_mail() { # $1=run-manifest.json 路徑 $2=去重指紋 → 結果信推入 FC_* 陣列
+  local mf="$1" fid="$2" dir outcome ms me dur="-" host subj
+  dir=$(cd "$(dirname "$mf")" 2>/dev/null && pwd) || dir=$(dirname "$mf")
+  outcome=$(fc_manifest_str "$mf" outcome); : "${outcome:=UNKNOWN}"
+  ms=$(fc_manifest_str "$mf" started_at); me=$(fc_manifest_str "$mf" finished_at)
+  local s1="" s2=""
+  [ -n "$ms" ] && s1=$(date -d "$ms" +%s 2>/dev/null)
+  [ -n "$me" ] && s2=$(date -d "$me" +%s 2>/dev/null)
+  if [ -n "$s1" ] && [ -n "$s2" ]; then
+    local d=$((s2 - s1))
+    if   [ "$d" -ge 3600 ]; then dur="$((d/3600))h$(((d%3600)/60))m"
+    elif [ "$d" -ge 60 ];   then dur="$((d/60))m$((d%60))s"
+    else dur="${d}s"; fi
+  fi
+
+  # 各 table 統計: 輸出資料夾內每個 table 檔各有一行 {"type":"summary",...}
+  local summaries; summaries=$(grep -rhs '"type":"summary"' "$dir" 2>/dev/null || true)
+  local n_table=0 t_ck=0 t_ps=0 t_fl=0 t_ex=0 t_er=0 t_tg=0
+  local rows_txt="" rows_html="" line tb oc ck ps fl ex er tg hl td
+  td='padding:6px 10px;border:1px solid #e0e0e0'
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    tb=$(fc_field_str "$line" table);   oc=$(fc_field_str "$line" outcome)
+    ck=$(fc_field_num "$line" checked); ps=$(fc_field_num "$line" passed)
+    fl=$(fc_field_num "$line" failed);  ex=$(fc_field_num "$line" exceptions)
+    er=$(fc_field_num "$line" execution_errors); tg=$(fc_field_num "$line" target_only)
+    : "${ck:=0}" "${ps:=0}" "${fl:=0}" "${ex:=0}" "${er:=0}" "${tg:=0}"
+    n_table=$((n_table+1))
+    t_ck=$((t_ck+ck)); t_ps=$((t_ps+ps)); t_fl=$((t_fl+fl))
+    t_ex=$((t_ex+ex)); t_er=$((t_er+er)); t_tg=$((t_tg+tg))
+    rows_txt+=$(printf '  %-20s %11s %11s %7s %5s %5s %5s  %s' \
+      "$tb" "$ck" "$ps" "$fl" "$ex" "$er" "$tg" "${oc:-?}")$'\n'
+    hl=""
+    if [ "$fl" -gt 0 ] || [ "$er" -gt 0 ]; then hl=' style="background:#fdf6f6"'; fi
+    rows_html+='<tr'"$hl"'><td style="'"$td"';font-weight:bold">'"$(html_escape "$tb")"'</td><td style="'"$td"';text-align:right">'"$ck"'</td><td style="'"$td"';text-align:right">'"$ps"'</td><td style="'"$td"';text-align:right">'"$fl"'</td><td style="'"$td"';text-align:right">'"$ex"'</td><td style="'"$td"';text-align:right">'"$er"'</td><td style="'"$td"';text-align:right">'"$tg"'</td><td style="'"$td"';white-space:nowrap">'"$(html_escape "${oc:-?}")"'</td></tr>'
+  done <<< "$summaries"
+
+  # 異常明細: 直接把差異紀錄列進信裡 (最多 10 筆)，收件人不用登主機就知道是什麼錯
+  # 來源 = 輸出資料夾的差異 JSONL (一表一檔，檔名即表名)。差異紀錄本身不帶表名，
+  # 故不用 -h: 保留 grep 的「檔名:」前綴，把表名一起印進信裡，多表時才分得出來
+  local exc_top="" exc_detail="" exc_raw
+  if [ "$t_ex" -gt 0 ] || [ "$t_fl" -gt 0 ]; then
+    exc_raw=$(cd "$dir" 2>/dev/null && grep -sHE '"severity":"(EXCEPTION|DIFF)"' -- * 2>/dev/null)
+    local eline etb ejson epk esk epath ecls esev ereq esv eav edesc
+    while IFS= read -r eline; do
+      [ -z "$eline" ] && continue
+      etb="${eline%%:*}"; ejson="${eline#*:}"
+      epk=$(fc_field_str "$ejson" pk);   esk=$(fc_field_str "$ejson" sk)
+      epath=$(fc_field_str "$ejson" path); ecls=$(fc_field_str "$ejson" classification)
+      esev=$(fc_field_str "$ejson" severity); ereq=$(fc_field_str "$ejson" required_type)
+      esv=$(fc_field_str "$ejson" source_value); eav=$(fc_field_str "$ejson" actual_value)
+      esv=${esv:0:60}; eav=${eav:0:60}
+      # 白話說明: 讓收件人不用懂分類代碼也知道這筆是什麼問題
+      if [ "$ecls" = "SOURCE_UNCASTABLE" ]; then
+        edesc="型別不相容 — 欄位要求 ${ereq:-?}，來源值 \"${esv}\" 無法轉型"
+      elif [ "$esev" = "DIFF" ] || [ -z "$ecls" ]; then
+        edesc="值不一致 — 來源=\"${esv}\" 目標=\"${eav}\""
+      else
+        edesc="${ecls} — 要求 ${ereq:-?}，來源=\"${esv}\" 目標=\"${eav}\""
+      fi
+      exc_detail+="  $etb  key=[${epk:-?}${esk:+/$esk}]  ${epath:-?}"$'\n'"      → $edesc"$'\n'
+    done <<< "$(printf '%s' "$exc_raw" | head -10)"
+    # 欄位分布: 異常超過 10 筆時，補一個「錯集中在哪張表哪個欄位」的統計
+    if [ $((t_ex + t_fl)) -gt 10 ]; then
+      exc_top=$(printf '%s' "$exc_raw" \
+        | sed -n 's/^\([^:]*\):.*"path":"\([^"]*\)".*/\1  \2/p' | sort | uniq -c | sort -rn | head -5 \
+        | awk '{c=$1; $1=""; printf "  %6s 筆 %s\n", c, $0}')
+    fi
+  fi
+
+  local icon color head
+  case "$outcome" in
+    PASS)                 icon="🟢"; color="#188038"; head="FullCheck 完成 — PASS" ;;
+    PASS_WITH_EXCEPTIONS) icon="🟠"; color="#f9ab00"; head="FullCheck 完成 — PASS_WITH_EXCEPTIONS (${t_ex} 筆 exception)" ;;
+    *)                    icon="🔴"; color="#d93025"; head="FullCheck 完成 — $outcome (failed=$t_fl)" ;;
+  esac
+  host=$(hostname 2>/dev/null || echo "?")
+  subj="$ENV_NAME"; [ -n "${HOST_ROLE:-}" ] && subj="$ENV_NAME·$HOST_ROLE"
+
+  local body
+  body="nimo-full-check 全量複核已結束，結果如下:
+
+結果   : $outcome
+開始   : ${ms:-?} (UTC)
+結束   : ${me:-?} (UTC)
+耗時   : $dur
+輸出   : $dir
+
+各 Table 統計 (共 $n_table 個):
+$(printf '  %-20s %11s %11s %7s %5s %5s %5s  %s' table checked passed failed exc err tgt outcome)
+$rows_txt  合計: checked=$t_ck passed=$t_ps failed=$t_fl exceptions=$t_ex exec_err=$t_er target_only=$t_tg
+
+欄位說明:
+  checked=檢核筆數  passed=通過筆數
+  failed=不符筆數 (來源與目標不一致，須補搬後重新驗證)
+  exc=來源型別例外 (來源資料原生型別問題，非搬遷錯誤；逐筆確認後列例外清單結案)
+  err=執行錯誤 (讀取/連線等程式面錯誤)  tgt=目標端多出筆數 (來源不存在)
+"
+  [ -n "$exc_detail" ] && body+="
+異常明細 (最多列 10 筆，本次共 $((t_ex + t_fl)) 筆；完整清單見輸出資料夾各 table 檔):
+$exc_detail"
+  [ -n "$exc_top" ] && body+="
+異常欄位分布 Top 5 (依筆數):
+$exc_top
+"
+  if [ -n "$exc_detail" ]; then
+    body+="
+【快速指令】(登入主機後可直接複製執行；輸出每行開頭即表名)
+  看全部異常明細:  cd $dir && grep -HE '\"severity\":\"(EXCEPTION|DIFF)\"' -- *
+  只看某個欄位  :  cd $dir && grep -HE '\"severity\":\"(EXCEPTION|DIFF)\"' -- * | grep <欄位名>
+  看各表統計    :  cd $dir && grep -H '\"type\":\"summary\"' -- *
+"
+  fi
+  body+="
+---
+環境: $subj  主機: $host
+時間: $(date '+%F %T %Z')
+(本信由 nimoshake-alert.sh 偵測到 FullCheck 結束自動發送)"
+
+  local html
+  html='<div style="font-family:-apple-system,'"'Microsoft JhengHei','PingFang TC'"',Arial,sans-serif;font-size:14px;color:#202124;max-width:900px">'
+  html+='<div style="border-left:4px solid '"$color"';padding:10px 14px;background:#f8f9fa;margin-bottom:14px;border-radius:0 6px 6px 0"><b style="color:'"$color"'">'"$(html_escape "$icon $head")"'</b><br><span style="color:#5f6368">耗時: '"$(html_escape "$dur")"'</span></div>'
+  html+='<table cellspacing="0" cellpadding="0" style="border-collapse:collapse;font-size:13px;margin-bottom:14px">'
+  html+='<tr><td style="padding:4px 12px 4px 0;color:#5f6368;white-space:nowrap">開始</td><td>'"$(html_escape "${ms:-?}")"' (UTC)</td></tr>'
+  html+='<tr><td style="padding:4px 12px 4px 0;color:#5f6368">結束</td><td>'"$(html_escape "${me:-?}")"' (UTC)</td></tr>'
+  html+='<tr><td style="padding:4px 12px 4px 0;color:#5f6368">輸出</td><td><code style="word-break:break-all">'"$(html_escape "$dir")"'</code></td></tr></table>'
+  if [ "$n_table" -gt 0 ]; then
+    html+='<div style="font-weight:bold;margin-bottom:6px">各 Table 統計（共 '"$n_table"' 個）</div>'
+    html+='<table cellspacing="0" cellpadding="0" style="border-collapse:collapse;width:100%;font-size:13px"><tr style="background:#f1f3f4">'
+    local h
+    for h in table checked passed failed exceptions exec_err target_only outcome; do
+      html+='<th style="'"$td"';text-align:left;white-space:nowrap">'"$h"'</th>'
+    done
+    html+='</tr>'"$rows_html"'<tr style="background:#f8f9fa;font-weight:bold"><td style="'"$td"'">合計</td><td style="'"$td"';text-align:right">'"$t_ck"'</td><td style="'"$td"';text-align:right">'"$t_ps"'</td><td style="'"$td"';text-align:right">'"$t_fl"'</td><td style="'"$td"';text-align:right">'"$t_ex"'</td><td style="'"$td"';text-align:right">'"$t_er"'</td><td style="'"$td"';text-align:right">'"$t_tg"'</td><td style="'"$td"'">'"$(html_escape "$outcome")"'</td></tr></table>'
+    html+='<div style="color:#5f6368;font-size:12px;margin-top:6px;line-height:1.7"><b>欄位說明</b>：checked＝檢核筆數／passed＝通過筆數／<b style="color:#d93025">failed＝不符筆數</b>（來源與目標不一致，須補搬後重新驗證）／<b style="color:#e37400">exceptions＝來源型別例外</b>（來源資料原生型別問題，非搬遷錯誤；逐筆確認後列例外清單結案）／exec_err＝執行錯誤（程式面錯誤）／target_only＝目標端多出筆數</div>'
+  fi
+  if [ -n "$exc_detail" ]; then
+    html+='<div style="font-weight:bold;margin:14px 0 6px">異常明細（最多列 10 筆，本次共 '"$((t_ex + t_fl))"' 筆）</div><pre style="background:#f8f9fa;border:1px solid #e0e0e0;padding:10px;font-size:12px;overflow-x:auto;margin:0;line-height:1.8">'"$(html_escape "$exc_detail")"'</pre><div style="color:#5f6368;font-size:12px;margin-top:4px">格式：[主鍵] 欄位路徑: 要求型別，來源值（分類）。完整清單見輸出資料夾各 table 檔的單行 JSON。</div>'
+  fi
+  if [ -n "$exc_top" ]; then
+    html+='<div style="font-weight:bold;margin:14px 0 6px">異常欄位分布 Top 5（依筆數）</div><pre style="background:#f8f9fa;border:1px solid #e0e0e0;padding:10px;font-size:12px;overflow-x:auto;margin:0">'"$(html_escape "$exc_top")"'</pre>'
+  fi
+  if [ -n "$exc_detail" ]; then
+    local cmd_all cmd_one cmd_sum
+    cmd_all="cd $dir && grep -HE '\"severity\":\"(EXCEPTION|DIFF)\"' -- *"
+    cmd_one="cd $dir && grep -HE '\"severity\":\"(EXCEPTION|DIFF)\"' -- * | grep <欄位名>"
+    cmd_sum="cd $dir && grep -H '\"type\":\"summary\"' -- *"
+    html+='<div style="font-weight:bold;margin:14px 0 6px">快速指令（登入主機後可直接複製執行）</div><table cellspacing="0" cellpadding="0" style="border-collapse:collapse;font-size:12px"><tr><td style="padding:3px 12px 3px 0;color:#5f6368;white-space:nowrap">看全部異常明細</td><td><code style="word-break:break-all">'"$(html_escape "$cmd_all")"'</code></td></tr><tr><td style="padding:3px 12px 3px 0;color:#5f6368">只看某個欄位</td><td><code style="word-break:break-all">'"$(html_escape "$cmd_one")"'</code></td></tr><tr><td style="padding:3px 12px 3px 0;color:#5f6368">看各表統計</td><td><code style="word-break:break-all">'"$(html_escape "$cmd_sum")"'</code></td></tr></table>'
+  fi
+  html+='<div style="color:#80868b;font-size:12px;border-top:1px solid #e0e0e0;margin-top:18px;padding-top:10px;line-height:1.7">環境: <b>'"$(html_escape "$subj")"'</b>　主機: '"$(html_escape "$host")"'　時間: '"$(date '+%F %T %Z')"'<br>（本信由 nimoshake-alert.sh 偵測到 FullCheck 結束自動發送）</div></div>'
+
+  FC_IDS+=("$fid")
+  FC_SUBJECTS+=("【StarCo $subj】$icon $head")
+  FC_BODIES+=("$body")
+  FC_HTMLS+=("$html")
+}
+
+# FullCheck 異常結束告警: 正常跑完「一定」會寫 run-manifest.json，
+# 所以「程序消失 + 沒有新結果檔」= 中途被終止 (OOM/kill/斷線/Ctrl+C)，失敗也要通知。
+# 判斷順序刻意「先查程序、再掃 manifest」: 程序剛結束時本輪 manifest 掃描
+# 會撿到結果 → 走完成通知，不會被誤判成異常結束。
+FC_RUN_FILE="$STATE_DIR/.fullcheck_running"
+FC_FAIL_SUBJECT=""; FC_FAIL_BODY=""; FC_FAIL_HTML=""
+
+fc_build_fail_mail() { # $1=首次偵測執行中的時間戳 → 填入 FC_FAIL_*
+  local fs="$1" host subj dur
+  host=$(hostname 2>/dev/null || echo "?")
+  subj="$ENV_NAME"; [ -n "${HOST_ROLE:-}" ] && subj="$ENV_NAME·$HOST_ROLE"
+  local d=$((NOW - fs))
+  if [ "$d" -ge 3600 ]; then dur="$((d/3600))h$(((d%3600)/60))m"; else dur="$((d/60))m"; fi
+  FC_FAIL_SUBJECT="【StarCo $subj】🔴 FullCheck 異常結束 (未產出結果)"
+  FC_FAIL_BODY="偵測到 nimo-full-check 程序已消失，但輸出資料夾沒有出現新的
+run-manifest.json (正常跑完一定會寫入結果檔) → 本次複核未完成。
+
+首次偵測執行中: $(date -d "@$fs" '+%F %T %Z' 2>/dev/null || echo "$fs")
+已執行約      : $dur
+監看目錄      : $FULLCHECK_DIR
+
+可能原因: 手動中止 (Ctrl+C / kill)、記憶體不足被 OOM killer 終止、
+來源/目標連線中斷、磁碟空間不足。
+👉 處理:
+  1. 查執行終端機 / nohup 輸出的最後訊息
+  2. dmesg | grep -iE 'kill|oom'  看是否被 OOM 終止
+  3. df -h  確認磁碟空間
+  4. 排除原因後直接重下原本的 fullcheck 指令即可 (每次執行都是完整重跑)
+
+---
+環境: $subj  主機: $host
+時間: $(date '+%F %T %Z')
+(本信由 nimoshake-alert.sh 偵測到 FullCheck 異常結束自動發送)"
+  FC_FAIL_HTML='<div style="font-family:-apple-system,'"'Microsoft JhengHei','PingFang TC'"',Arial,sans-serif;font-size:14px;color:#202124;max-width:860px">'
+  FC_FAIL_HTML+=$(html_card "#d93025" "[high] FullCheck 異常結束（未產出結果，已執行約 $dur）" \
+    "nimo-full-check 程序已消失，但輸出資料夾沒有新的 run-manifest.json（正常跑完一定會寫）→ 本次複核未完成。可能原因: 手動中止 / OOM / 連線中斷 / 磁碟滿。" \
+    "1) 查執行終端機或 nohup 輸出的最後訊息  2) dmesg | grep -iE 'kill|oom' 看是否 OOM  3) df -h 確認磁碟空間  4) 排除後直接重下原本的 fullcheck 指令 (每次執行都是完整重跑)")
+  FC_FAIL_HTML+='<div style="color:#80868b;font-size:12px;border-top:1px solid #e0e0e0;margin-top:18px;padding-top:10px;line-height:1.7">監看目錄: <code style="word-break:break-all">'"$(html_escape "$FULLCHECK_DIR")"'</code><br>環境: <b>'"$(html_escape "$subj")"'</b>　主機: '"$(html_escape "$host")"'　時間: '"$(date '+%F %T %Z')"'<br>（本信由 nimoshake-alert.sh 偵測到 FullCheck 異常結束自動發送）</div></div>'
+}
+
+# ---- 原生版 (711) 支援: FULLCHECK_MODE=native ---------------------------------
+# 原生 git 版不寫 run-manifest.json，判別改為: 程序結束 + 讀 -d 輸出資料夾的
+# diff 檔 (原生有差異才留檔、一行一筆 src[..] != dst[..]，空檔會被自己刪掉)。
+# 跑完/掛掉的區分: 開跑時記下 log 檔中 "full-check completes" 出現次數，
+# 程序消失後次數有 +1 = 正常跑完；沒設 FULLCHECK_NATIVE_LOG 則一律視為跑完。
+FC_NATIVE_SUBJECT=""; FC_NATIVE_BODY=""; FC_NATIVE_HTML=""
+
+fc_native_completes() { # 印出 log 檔中結束標記出現次數 (檔案不存在=0)
+  local c=""
+  [ -n "$FULLCHECK_NATIVE_LOG" ] && [ -f "$FULLCHECK_NATIVE_LOG" ] && \
+    c=$(grep -c 'full-check completes' "$FULLCHECK_NATIVE_LOG" 2>/dev/null)
+  printf '%s' "${c:-0}"
+}
+
+fc_run_write() { # 建立/重置執行追蹤檔 (native 模式多記結束標記基準數)
+  {
+    printf 'first_seen\t%s\n' "$NOW"
+    [ "$FULLCHECK_MODE" = "native" ] && printf 'completes_base\t%s\n' "$(fc_native_completes)"
+  } > "$FC_RUN_FILE" 2>/dev/null
+}
+
+fc_build_native_mail() { # 原生模式結果信 (讀 -d 輸出資料夾的 diff 檔)
+  local out="${FULLCHECK_DIR%%,*}" host subj
+  host=$(hostname 2>/dev/null || echo "?")
+  subj="$ENV_NAME"; [ -n "${HOST_ROLE:-}" ] && subj="$ENV_NAME·$HOST_ROLE"
+  # 各表差異筆數 (一表一檔，行數=筆數)；原生無差異不留檔
+  local total=0 n_table=0 counts="" samples="" f n
+  for f in "$out"/*; do
+    [ -f "$f" ] || continue
+    n=$(wc -l < "$f" 2>/dev/null | tr -d ' '); : "${n:=0}"
+    [ "$n" -eq 0 ] && continue
+    n_table=$((n_table+1)); total=$((total+n))
+    counts+="  $(basename "$f")  ${n} 筆"$'\n'
+    [ -z "$samples" ] && samples=$(head -5 "$f" 2>/dev/null | cut -c1-200 | sed 's/^/  /')
+  done
+  local icon color head
+  if [ "$total" -eq 0 ]; then
+    icon="🟢"; color="#188038"; head="FullCheck 完成 — 未發現差異"
+  else
+    icon="🔴"; color="#d93025"; head="FullCheck 完成 — 發現 $total 筆差異 ($n_table 張表)"
+  fi
+  FC_NATIVE_SUBJECT="【StarCo $subj】$icon $head"
+  FC_NATIVE_BODY="nimo-full-check (原生版) 已結束。
+
+結果   : $head
+輸出   : $out
+"
+  if [ "$total" -gt 0 ]; then
+    FC_NATIVE_BODY+="
+各表差異筆數:
+$counts
+差異內容節錄 (前 5 行，格式 src[來源] != dst[目標]):
+$samples
+
+【快速指令】看完整差異: cd $out && cat *
+"
+  fi
+  FC_NATIVE_BODY+="
+(原生版不輸出 checked/passed 統計，僅能回報差異筆數與內容)"
+  [ -z "$FULLCHECK_NATIVE_LOG" ] && FC_NATIVE_BODY+="
+(未設定 FULLCHECK_NATIVE_LOG，無法區分正常結束或中途被終止；若懷疑執行中斷，重跑一次即可)"
+  FC_NATIVE_BODY+="
+---
+環境: $subj  主機: $host
+時間: $(date '+%F %T %Z')
+(本信由 nimoshake-alert.sh 偵測到 FullCheck 結束自動發送)"
+  FC_NATIVE_HTML='<div style="font-family:-apple-system,'"'Microsoft JhengHei','PingFang TC'"',Arial,sans-serif;font-size:14px;color:#202124;max-width:860px"><div style="border-left:4px solid '"$color"';padding:10px 14px;background:#f8f9fa;margin-bottom:14px;border-radius:0 6px 6px 0"><b style="color:'"$color"'">'"$(html_escape "$icon $head")"'</b><br><span style="color:#5f6368">輸出: <code>'"$(html_escape "$out")"'</code></span></div>'
+  if [ "$total" -gt 0 ]; then
+    FC_NATIVE_HTML+='<div style="font-weight:bold;margin-bottom:6px">各表差異筆數</div><pre style="background:#f8f9fa;border:1px solid #e0e0e0;padding:10px;font-size:12px;margin:0 0 12px">'"$(html_escape "$counts")"'</pre><div style="font-weight:bold;margin-bottom:6px">差異內容節錄（前 5 行）</div><pre style="background:#f8f9fa;border:1px solid #e0e0e0;padding:10px;font-size:12px;overflow-x:auto;margin:0">'"$(html_escape "$samples")"'</pre>'
+  fi
+  FC_NATIVE_HTML+='<div style="color:#80868b;font-size:12px;border-top:1px solid #e0e0e0;margin-top:16px;padding-top:10px;line-height:1.7">原生版不輸出 checked/passed 統計，僅回報差異筆數與內容。<br>環境: <b>'"$(html_escape "$subj")"'</b>　主機: '"$(html_escape "$host")"'　時間: '"$(date '+%F %T %Z')"'<br>（本信由 nimoshake-alert.sh 偵測到 FullCheck 結束自動發送）</div></div>'
+}
+
+if [ -n "${FULLCHECK_DIR:-}" ]; then
+  # 1) 程序是否在跑 (要先於 manifest 掃描，見上方註解)
+  FC_PROC_ALIVE=0
+  if command -v pgrep >/dev/null 2>&1; then
+    pgrep -f "$FULLCHECK_PROC_PATTERN" >/dev/null 2>&1 && FC_PROC_ALIVE=1
+  fi
+  FC_BASELINE=0
+  if [ "$FULLCHECK_MODE" = "starco" ]; then
+  [ -f "$FC_SEEN_FILE" ] || FC_BASELINE=1
+  for fc_root in $(printf '%s' "$FULLCHECK_DIR" | tr ',;' ' '); do
+    [ -z "$fc_root" ] && continue
+    if [ ! -d "$fc_root" ]; then
+      log_line "WARN: [$ENV_NAME] FULLCHECK_DIR 不存在: $fc_root (請確認 conf 路徑)"
+      continue
+    fi
+    # 掃 FULLCHECK_DIR 本身與其下一層 (-d 輸出資料夾通常在執行目錄下一層)
+    for fc_mf in "$fc_root"/run-manifest.json "$fc_root"/*/run-manifest.json; do
+      [ -f "$fc_mf" ] || continue
+      fc_fin=$(fc_manifest_str "$fc_mf" finished_at)
+      if [ -n "$fc_fin" ]; then
+        fc_fid="$fc_fin|$(fc_manifest_str "$fc_mf" outcome)"
+      else
+        fc_fid=$(md5sum "$fc_mf" 2>/dev/null | awk '{print $1}'); : "${fc_fid:=$fc_mf}"
+      fi
+      grep -qxF "$fc_fid" "$FC_SEEN_FILE" 2>/dev/null && continue
+      if [ "$FC_BASELINE" -eq 1 ]; then
+        [ "$STATUS_ONLY" -eq 0 ] && printf '%s\n' "$fc_fid" >> "$FC_SEEN_FILE" 2>/dev/null
+        continue
+      fi
+      fc_build_mail "$fc_mf" "$fc_fid"
+    done
+  done
+  if [ "$FC_BASELINE" -eq 1 ] && [ "$STATUS_ONLY" -eq 0 ]; then
+    touch "$FC_SEEN_FILE" 2>/dev/null || true
+    log_line "INFO: [$ENV_NAME] FullCheck 通知首次啟用，既有結果記為基準，不補寄歷史"
+  fi
+  fi  # FULLCHECK_MODE=starco (native 模式不掃 manifest，靠下方程序狀態機)
+
+  # 2) 執行中/異常結束狀態機 (狀態檔 .fullcheck_running: first_seen / gone_since)
+  if [ "$FC_PROC_ALIVE" -eq 1 ]; then
+    if [ ! -f "$FC_RUN_FILE" ]; then
+      if [ "$STATUS_ONLY" -eq 0 ]; then
+        fc_run_write
+        log_line "INFO: [$ENV_NAME] 偵測到 nimo-full-check 執行中，開始追蹤 (mode=$FULLCHECK_MODE)"
+      fi
+    elif grep -q '^gone_since' "$FC_RUN_FILE" 2>/dev/null && [ "$STATUS_ONLY" -eq 0 ]; then
+      # 程序又出現 (新的一輪複核開跑) → 重置追蹤
+      fc_run_write
+    fi
+  elif [ -f "$FC_RUN_FILE" ]; then
+    if [ "$FULLCHECK_MODE" = "starco" ] && [ "${#FC_IDS[@]}" -gt 0 ]; then
+      # 程序結束且本輪撿到新結果 → 正常結束，交給完成通知
+      [ "$STATUS_ONLY" -eq 0 ] && rm -f "$FC_RUN_FILE" 2>/dev/null
+    else
+      fc_gone=$(awk -F '\t' '$1=="gone_since"{print $2}' "$FC_RUN_FILE" 2>/dev/null)
+      if [ -z "$fc_gone" ]; then
+        # 寬限一輪 (約 1 分鐘): 避免「程序剛結束、結果檔還在寫」的競態誤報
+        [ "$STATUS_ONLY" -eq 0 ] && printf 'gone_since\t%s\n' "$NOW" >> "$FC_RUN_FILE" 2>/dev/null
+      elif [ "$FULLCHECK_MODE" = "native" ]; then
+        # 原生: log 結束標記次數比開跑時多 = 正常跑完；否則 = 中途被終止。
+        # 沒設 FULLCHECK_NATIVE_LOG 時無從區分，一律視為跑完 (信中已註明)
+        fc_base=$(awk -F '\t' '$1=="completes_base"{print $2}' "$FC_RUN_FILE" 2>/dev/null); : "${fc_base:=0}"
+        if [ -z "$FULLCHECK_NATIVE_LOG" ] || [ "$(fc_native_completes)" -gt "$fc_base" ]; then
+          fc_build_native_mail
+        else
+          fc_first=$(awk -F '\t' '$1=="first_seen"{print $2}' "$FC_RUN_FILE" 2>/dev/null)
+          fc_build_fail_mail "${fc_first:-$NOW}"
+        fi
+      else
+        fc_first=$(awk -F '\t' '$1=="first_seen"{print $2}' "$FC_RUN_FILE" 2>/dev/null)
+        fc_build_fail_mail "${fc_first:-$NOW}"
+      fi
+    fi
+  fi
+fi
+
 # ---- 更新 offset ------------------------------------------------------------
 # FREEZE (log 遺失) 期間不動 offset: 同一檔案搬回來可從原 offset 續讀，
 # 不會把整份歷史 log 重掃成「新增事件」；真正輪替的新檔仍由變小檢查歸零
@@ -295,6 +662,19 @@ if [ "$STATUS_ONLY" -eq 1 ]; then
 }"
   echo "--- 已解除 ---"; printf '%s' "${RESOLVED_LIST:-  (無)
 }"
+  if [ -n "${FULLCHECK_DIR:-}" ]; then
+    echo "--- FullCheck ---"
+    if [ "${FC_PROC_ALIVE:-0}" -eq 1 ]; then
+      echo "  執行中 (程序存在，結束後 1 分鐘內通知結果)"
+    elif [ -n "$FC_FAIL_SUBJECT" ]; then
+      echo "  疑似異常結束 (程序消失且無新結果檔)，待寄: $FC_FAIL_SUBJECT"
+    fi
+    if [ "${#FC_SUBJECTS[@]}" -gt 0 ]; then
+      printf '  待通知: %s\n' "${FC_SUBJECTS[@]}"
+    elif [ "${FC_PROC_ALIVE:-0}" -eq 0 ] && [ -z "$FC_FAIL_SUBJECT" ]; then
+      echo "  (無待通知結果)"
+    fi
+  fi
   exit 0
 fi
 
@@ -414,9 +794,40 @@ if [ -n "$FIRING_LIST" ] && can_send; then
   fi
 fi
 
+# 4) FullCheck 完成通知 (conf 設 FULLCHECK_DIR 才會有)
+#    結果信是使用者主動要的完成通知，不受 ALERT_MIN_SEVERITY 過濾；
+#    仍走冷卻/單次上限。寄成功才記指紋，失敗/被冷卻擋下 → 下一輪重試。
+fc_i=0
+while [ "$fc_i" -lt "${#FC_IDS[@]}" ]; do
+  if can_send; then
+    if sendgrid_send "${FC_SUBJECTS[$fc_i]}" "${FC_BODIES[$fc_i]}" "${FC_HTMLS[$fc_i]}"; then
+      after_send
+      printf '%s\n' "${FC_IDS[$fc_i]}" >> "$FC_SEEN_FILE" 2>/dev/null || true
+    fi
+  fi
+  fc_i=$((fc_i + 1))
+done
+# FullCheck 異常結束 (程序消失且無新結果檔): 寄成功才清追蹤檔，失敗下一輪重試
+if [ -n "$FC_FAIL_SUBJECT" ] && can_send; then
+  if sendgrid_send "$FC_FAIL_SUBJECT" "$FC_FAIL_BODY" "$FC_FAIL_HTML"; then
+    after_send
+    rm -f "$FC_RUN_FILE" 2>/dev/null || true
+  fi
+fi
+# FullCheck 原生模式結果信 (一次執行一封，去重靠追蹤檔生命週期)
+if [ -n "$FC_NATIVE_SUBJECT" ] && can_send; then
+  if sendgrid_send "$FC_NATIVE_SUBJECT" "$FC_NATIVE_BODY" "$FC_NATIVE_HTML"; then
+    after_send
+    rm -f "$FC_RUN_FILE" 2>/dev/null || true
+  fi
+fi
+
 if [ "$MAILS_SENT" -eq 0 ]; then
   log_line "OK: [$ENV_NAME] 本次無需寄信 (dry_run=$DRY_RUN)"
 else
   log_line "DONE: [$ENV_NAME] 本次寄出/處理 $MAILS_SENT 封 (dry_run=$DRY_RUN)"
 fi
+# 心跳: 只在「本輪完整跑完」才寫。引擎壞掉/排程失效 → 心跳停更 →
+# 獨立的 nimoshake-watchdog.sh (cron 每 5 分鐘) 會發「監控引擎停擺」告警
+date +%s > "$STATE_DIR/.heartbeat" 2>/dev/null || true
 exit 0

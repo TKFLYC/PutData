@@ -50,6 +50,29 @@ PROC_PATTERN="(^|/)nimo-shake(\.(linux|darwin))?( |$)"  # pgrep -f 用的錨定 
 # 基準值可由「上次完成的全量 log」一鍵產生:  bash nimoshake-monitor.sh --totals /path/to/舊全量log
 # TABLE_TOTALS="Orders:5200000,Users:130000"
 
+# ---- FullCheck 結束通知 (選填) ----
+# 設定後，nimo-full-check 全量複核跑完 (輸出資料夾出現 run-manifest.json)
+# 1 分鐘內自動寄結果信: outcome (PASS/PASS_WITH_EXCEPTIONS/FAIL)、各 table
+# 統計 (checked/passed/failed/exceptions)、耗時。fullcheck 照原本指令跑即可。
+# 失敗也會通知: 程序消失卻沒有新結果檔 (OOM/kill/斷線) → 🔴 異常結束告警。
+# 填 nimo-full-check.linux 的「執行目錄」(輸出資料夾 -d 通常在其下一層)，
+# 可逗號分隔多個。首次啟用只建基準，不會補寄歷史結果；同一次結果只通知一次。
+# FULLCHECK_DIR="/home/ForTest_NimoShakeStarCoVersion/nimo-shake-starco-1.0.14-sc.20260818"
+# FULLCHECK_PROC_PATTERN="(^|/)nimo-full-check(\.(linux|darwin))?( |$)"  # 程序比對 regex，執行檔改名才需調整
+# --- 原生版環境專用: 機器上的 fullcheck 是原生 git 版時才設 ---
+# 原生版不寫 run-manifest.json，判別改用「程序結束 + 讀輸出資料夾 diff 檔」。
+# 此時 FULLCHECK_DIR 請直接填 -d 輸出資料夾本身 (單一路徑)。
+# FULLCHECK_MODE="native"
+# FULLCHECK_NATIVE_LOG="/path/to/fullcheck.log"  # (建議) 啟動時導出的 log 檔
+#     (nohup ./nimo-full-check ... > fullcheck.log 2>&1)，用於區分跑完/中途掛掉；
+#     不設則程序消失一律視為跑完
+
+# ---- 看門狗 (監控引擎自我監控) ----
+# nimoshake-watchdog.sh 由 cron 每 5 分鐘獨立執行 (見 crontab.example)，
+# 檢查引擎心跳 (state/.heartbeat)，停更即寄「🔴 監控引擎停擺」、恢復寄 🟢。
+# WATCHDOG_STALE_SECONDS=300      # 心跳落後幾秒視為停擺 (預設 5 分鐘)
+# WATCHDOG_REALERT_SECONDS=21600  # 停擺未恢復多久提醒一次 (預設 6 小時)
+
 # ---- 系統資源判讀門檻 (附在告警信的「系統狀態判讀」表) ----
 DISK_ALERT_PCT=85         # 磁碟使用率超過此 % 判為異常
 MEM_ALERT_PCT=90          # 記憶體使用率超過此 % 判為異常
