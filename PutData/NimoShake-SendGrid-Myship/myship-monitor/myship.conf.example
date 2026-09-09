@@ -49,6 +49,17 @@ PROC_PATTERN="(^|/)nimo-shake(\.(linux|darwin))?( |$)"  # pgrep -f 用的錨定 
 # 設定各 table 來源總筆數後，報表 [3] 會顯示 進度% 與 預計剩餘時間。
 # 基準值可由「上次完成的全量 log」一鍵產生:  bash nimoshake-monitor.sh --totals /path/to/舊全量log
 # TABLE_TOTALS="Orders:5200000,Users:130000"
+# (v4.3) 沒設 TABLE_TOTALS 時，全量進行中會自動向 NimoShake 內建 API (localhost:9341/progress) 取
+#        各 table 來源筆數當基準 (DynamoDB ItemCount 概估)，不用手動填也有進度%；有設的 table 以這裡為準。
+# ---- NimoShake 內建監控 API 端口 (選填；與 nimo-shake.conf 的 full_sync.http_port / incr_sync.http_port 一致) ----
+# HTTP_FULL_PORT=9341       # 全量進度 API (/progress)，[3] 進度% 自動基準的來源
+# HTTP_INCR_PORT=9340       # 增量統計 API (/metric)，[2] CDC 讀取/寫入累計的來源
+# ---- CDC (增量) 專版統計行字樣 (選填) ----
+# 專版 nimo-shake-starco 增量階段每 5 秒寫一行累計統計:
+#   [2026/09/07 19:53:59 UTC] [INFO] [stage=incr, get=21, write_success=21, tps=0, ckpt_times=21]
+# 監控會取最新一行的 get(讀取)/write_success(寫入)/tps/ckpt_times 與取樣區間增量顯示在 [2]。
+# 注意實際字樣是 stage=incr (等號)；grep 時請用 grep "stage=incr"。字樣改版時在此修改。
+# INCR_TAG="stage=incr"
 
 # ---- FullCheck 結束通知 (選填) ----
 # 設定後，nimo-full-check 全量複核跑完 (輸出資料夾出現 run-manifest.json)

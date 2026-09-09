@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# nimoshake-monitor.sh  v2.3  — NimoShake (DynamoDB -> MongoDB) 監控解析器
+# nimoshake-monitor.sh  v2.5  — NimoShake (DynamoDB -> MongoDB) 監控解析器
 # -----------------------------------------------------------------------------
 # 專案 : StarCo Migration (C2CPlatform)  環境: OPAPP / 賣貨便(MyShip)
 # 依賴 : 純 bash + awk + grep + (可選) curl / pgrep / ps  — 無外部套件
@@ -14,17 +14,27 @@
 #
 # 用法 (目標可為 log 檔、conf 檔、或留空):
 #   ./nimoshake-monitor.sh                        # 不帶參數: 自動找腳本旁唯一的 *.conf，用其 LOG_FILE
+#                                                 #   在互動終端機直接執行時自動進入持續刷新 (同 --watch)，
+#                                                 #   Ctrl-C 結束；輸出導向檔案/管線時仍為單次報表
 #   ./nimoshake-monitor.sh <env.conf>             # 指定 conf: 讀其 LOG_FILE 與門檻參數
 #   ./nimoshake-monitor.sh <logfile>              # 直接指定 log 檔 (臨時分析任何 log)
+#   ./nimoshake-monitor.sh --human [目標]         # 強制單次報表 (不進入持續刷新)
 #   ./nimoshake-monitor.sh --json [目標]          # JSON 輸出 (串接 dashboard)
 #   ./nimoshake-monitor.sh --conditions [目標]    # 給告警引擎用的條件清單
 #   ./nimoshake-monitor.sh --summary [目標]       # 逐面向判讀 (告警信的判讀表來源)
-#   ./nimoshake-monitor.sh --watch [秒] [目標]    # 持續刷新 (預設 10 秒)
+#   ./nimoshake-monitor.sh --watch [秒] [目標]    # 持續刷新 (預設 10 秒，Ctrl-C 結束)
 #   ./nimoshake-monitor.sh --totals <全量log> [log2...] # 統計各 table 實際筆數，產生 TABLE_TOTALS
 #                                                 # (全量若跨輪替檔，把 .log.2 .log.1 一起帶上)
 #
 # 全量進度百分比: conf 設 TABLE_TOTALS="Orders:5200000,Users:130000" (來源總筆數基準)
 #   後，報表 [3] 顯示 進度% 與 預計剩餘時間。基準值可用 --totals 從上次完成的全量 log 產生。
+#   v2.5 起: 程序在跑時 [3] 的已搬筆數/總筆數/進度% 直接採 NimoShake 內建 API
+#   http://localhost:9341/progress 的即時統計 (不用設任何東西)；API 打不到 (程序沒跑、離線看檔)
+#   才退回 log 批次估算 + TABLE_TOTALS/上次 API 總數當基準。
+# CDC (增量) 讀取/寫入操作資訊 (v2.5): 報表 [2] 與 --summary 的「CDC 讀寫」列，來源三選一疊加:
+#   (1) Incr API http://localhost:9340/metric 的 records_get / records_write / checkpoint_times
+#   (2) log 尾端取樣的逐批寫入行 "try write data with length[N], tp[INSERT|MODIFY|REMOVE]"
+#   (3) 專版 (nimo-shake-starco) 每 5 秒一行的增量統計 "[stage=incr, get=N, write_success=N, tps=N, ckpt_times=N]"
 #
 # --conditions 每行格式 (供 nimoshake-alert.sh 解析):
 #   TYPE|SEVERITY|ID|COUNT|TITLE|DETAIL
@@ -35,6 +45,7 @@
 #   NS_SLOW_WRITE_MS(200) NS_SLOW_SCAN_MS(500) NS_SCAN_TAIL_LINES(2000)
 #   NS_EXPECT_RUNNING(0) NS_PROC_PATTERN NS_DISK_ALERT_PCT(85) NS_MEM_ALERT_PCT(90)
 #   NS_HTTP_FULL_PORT(9341) NS_HTTP_INCR_PORT(9340) NS_HTTP_PPROF_PORT(9330)
+#   NS_INCR_TAG(stage=incr) NS_STATE_DIR(API 快照目錄；conf 模式預設 conf 旁 state/)
 # =============================================================================
 set -uo pipefail
 
@@ -48,18 +59,20 @@ PROC_PATTERN="${NS_PROC_PATTERN:-(^|/)nimo-shake(\.(linux|darwin))?( |$)}"   # �
 HTTP_FULL_PORT="${NS_HTTP_FULL_PORT:-9341}"
 HTTP_INCR_PORT="${NS_HTTP_INCR_PORT:-9340}"
 HTTP_PPROF_PORT="${NS_HTTP_PPROF_PORT:-9330}"
+INCR_TAG="${NS_INCR_TAG:-stage=incr}"
+STATE_DIR="${NS_STATE_DIR:-}"   # API 快照存放處 (conf 模式預設 conf 旁 state/；alert 會傳 NS_STATE_DIR)；沒有可寫目錄就不快照   # 專版增量統計行字樣 (實際 log: "[stage=incr, get=N, write_success=N, tps=N, ckpt_times=N]"，每 5 秒一行)
 TABLE_TOTALS="${NS_TABLE_TOTALS:-${TABLE_TOTALS:-}}"   # 選填: "Orders:5200000,Users:130000" → [3] 顯示進度%/預計剩餘
 
-MODE="human"; WATCH_INTERVAL=10; LOGFILE=""; CONF_PATH=""; TARGETS=()
+MODE="human"; MODE_EXPLICIT=0; WATCH_INTERVAL=10; LOGFILE=""; CONF_PATH=""; TARGETS=()
 while [ $# -gt 0 ]; do
   case "$1" in
-    --json)       MODE="json" ;;
-    --conditions) MODE="conditions" ;;
-    --summary)    MODE="summary" ;;
-    --totals)     MODE="totals" ;;
-    --human)      MODE="human" ;;
+    --json)       MODE="json";       MODE_EXPLICIT=1 ;;
+    --conditions) MODE="conditions"; MODE_EXPLICIT=1 ;;
+    --summary)    MODE="summary";    MODE_EXPLICIT=1 ;;
+    --totals)     MODE="totals";     MODE_EXPLICIT=1 ;;
+    --human)      MODE="human";      MODE_EXPLICIT=1 ;;
     --watch)
-      MODE="watch"
+      MODE="watch"; MODE_EXPLICIT=1
       if [ "${2:-}" ] && printf '%s' "${2:-}" | grep -qE '^[0-9]+$'; then WATCH_INTERVAL="$2"; shift; fi ;;
     -h|--help) grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*) echo "未知參數: $1" >&2; exit 2 ;;
@@ -67,6 +80,9 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+# 互動終端機直接執行且未指定模式 → 自動進入持續刷新 (啟動後一直更新，不用重複下指令)
+# 輸出導向檔案/管線 (如排程的 report.txt) 時 stdout 不是 TTY，維持單次報表不受影響
+if [ "$MODE_EXPLICIT" -eq 0 ] && [ -t 1 ]; then MODE="watch"; fi
 
 # ---- --totals: 統計各 table 實際筆數 (可接多個 log，全量跨輪替檔時一起給) ----
 if [ "$MODE" = "totals" ]; then
@@ -114,7 +130,27 @@ if printf '%s' "$LOGFILE" | grep -q '\.conf$'; then
   [ -n "${NS_EXPECT_RUNNING:-}" ]  && EXPECT_RUNNING="$NS_EXPECT_RUNNING"
   [ -n "${NS_PROC_PATTERN:-}" ]    && PROC_PATTERN="$NS_PROC_PATTERN"
   [ -n "${NS_TABLE_TOTALS:-}" ]    && TABLE_TOTALS="$NS_TABLE_TOTALS"
+  [ -n "${NS_HTTP_FULL_PORT:-}" ]  && HTTP_FULL_PORT="$NS_HTTP_FULL_PORT"
+  [ -n "${NS_HTTP_INCR_PORT:-}" ]  && HTTP_INCR_PORT="$NS_HTTP_INCR_PORT"
+  [ -n "${NS_INCR_TAG:-}" ]        && INCR_TAG="$NS_INCR_TAG"
+  [ -z "$STATE_DIR" ] && STATE_DIR="$(dirname "$CONF_PATH")/state"
 fi
+[ -n "$STATE_DIR" ] && mkdir -p "$STATE_DIR" 2>/dev/null
+# API 快照: 程序一死 API 就消失，[3]/[2] 會失去「中斷前跑到哪」。每次抓到就存一份，抓不到時拿最後一份顯示並標示時間
+API_SNAP_FILE=""; [ -n "$STATE_DIR" ] && [ -w "$STATE_DIR" ] && API_SNAP_FILE="$STATE_DIR/.api_snapshot"
+snap_save() { # kind body
+  [ -z "$API_SNAP_FILE" ] && return 0
+  { [ -f "$API_SNAP_FILE" ] && grep -v "^$1	" "$API_SNAP_FILE"; printf '%s\t%s\t%s\n' "$1" "$(date +%s)" "$2"; } > "$API_SNAP_FILE.tmp" 2>/dev/null && mv -f "$API_SNAP_FILE.tmp" "$API_SNAP_FILE" 2>/dev/null
+}
+snap_load() { # kind -> 印出 body；無回傳 1 (在 $(...) 內呼叫，存檔時間另用 snap_time 取)
+  [ -z "$API_SNAP_FILE" ] || [ ! -f "$API_SNAP_FILE" ] && return 1
+  local line; line=$(grep "^$1	" "$API_SNAP_FILE" | tail -n1); [ -z "$line" ] && return 1
+  printf '%s' "$line" | cut -f3-
+}
+snap_time() { # kind -> 印出存檔 epoch (無則空)
+  [ -z "$API_SNAP_FILE" ] || [ ! -f "$API_SNAP_FILE" ] && return 0
+  grep "^$1	" "$API_SNAP_FILE" | tail -n1 | cut -f2
+}
 if [ ! -f "$LOGFILE" ]; then echo "找不到 log 檔: $LOGFILE" >&2; exit 2; fi
 
 # ------------------------------------------------------------------ 工具
@@ -163,6 +199,20 @@ elif [ "$HAS_START_SYNC" -gt 0 ]; then STAGE="全量同步中"; STAGE_SYM="◌"
 elif [ "$HAS_PREPARE" -gt 0 ];    then STAGE="準備中";     STAGE_SYM="◌"
 fi
 [ "$PROC_RUNNING" -eq 0 ] && [ "$LOG_AGE" -ge "$STALL_SECONDS" ] && { STAGE="已停止"; STAGE_SYM="✗"; }
+# ---- 啟動次數 / 續傳方式: 每次啟動印一行 "configuration:"；之後 "checkpoint map:" = 沿用 checkpoint 直接增量續傳，
+#      "need full sync" = 沒有可用 checkpoint → 重跑全量 (checkpoint/manager.go CheckCkpt)
+STARTS=$(grep -c 'configuration:' "$LOGFILE" 2>/dev/null); STARTS=${STARTS:-0}
+LAST_START=""; RESUME_MODE=""
+if [ "$STARTS" -gt 0 ]; then
+  _sl=$(grep -n 'configuration:' "$LOGFILE" 2>/dev/null | tail -n1 | cut -d: -f1)
+  LAST_START=$(sed -n "${_sl}p" "$LOGFILE" 2>/dev/null | grep -oE '^\[[0-9/]+ [0-9:]{8}' | tr -d '[')
+  _ck=$(tail -n +"$_sl" "$LOGFILE" 2>/dev/null | grep -m1 -oE 'checkpoint map:|need full sync|prepare checkpoint start')
+  case "$_ck" in
+    "checkpoint map:")  RESUME_MODE="從 checkpoint 續傳增量 (跳過全量)" ;;
+    "need full sync"|"prepare checkpoint start") RESUME_MODE="重跑全量 (無可用 checkpoint)" ;;
+    *) RESUME_MODE="" ;;
+  esac
+fi
 LOG_ACTIVITY="active"
 if   [ "$LOG_AGE" -ge "$STALL_SECONDS" ]; then LOG_ACTIVITY="stopped"
 elif [ "$LOG_AGE" -ge 30 ];               then LOG_ACTIVITY="idle"; fi
@@ -224,27 +274,167 @@ if [ "$INCR_EVENTS" -gt 0 ]; then
     INCR_SPAN=$(( _ils - _ifs )); [ "$INCR_SPAN" -lt 0 ] && INCR_SPAN=$(( INCR_SPAN + 86400 ))
   fi
   [ "$INCR_SPAN" -gt 0 ] && INCR_RATE=$(awk -v n="$INCR_EVENTS" -v s="$INCR_SPAN" 'BEGIN{printf "%.1f", n/s}')
-  # 同步延遲: 取最後一筆帶 UpdateDate 的事件行，事件的來源變更時間 vs 行首處理時戳
-  _lagline=$(printf '%s' "$SAMPLE" | grep 'UpdateDate:' | tail -n1)
-  if [ -n "$_lagline" ]; then
-    _src=$(printf '%s' "$_lagline" | grep -oE 'UpdateDate:[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}' | tail -n1 | sed 's/^UpdateDate://')
-    _prc=$(printf '%s' "$_lagline" | grep -oE '^\[[0-9]{4}/[0-9]{2}/[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}' | tr -d '[')
-    if [ -n "$_src" ] && [ -n "$_prc" ]; then
-      _srce=$(date -u -d "${_src}Z" +%s 2>/dev/null)
-      _prce=$(date -u -d "$(printf '%s' "$_prc" | tr '/' '-')" +%s 2>/dev/null)
-      if [ -n "$_srce" ] && [ -n "$_prce" ]; then
-        INCR_LAG_SEC=$(( _prce - _srce )); [ "$INCR_LAG_SEC" -lt 0 ] && INCR_LAG_SEC=0
-        INCR_LAG="$(human_secs "$INCR_LAG_SEC")"
-      fi
+  # 同步延遲 (資料延遲) = NimoShake 處理該批的時間 (行首時戳) − 該批最後一筆在來源發生的時間
+  #   來源時間 = DynamoDB Stream 紀錄的 ApproximateCreationDateTime (精度秒)，NimoShake 印在
+  #   "try write data ... approximate[2026-09-08 01:25:33 +0000 UTC]" (每批) 與 checkpoint 行 "ApproximateTime:..." (每 20 秒)
+  #   (v4.2 誤用 UpdateDate＝checkpoint 寫入時間，與行首時戳同為「現在」，永遠算成 0；v4.3 修正)
+  #   注意: 來源沒新資料時最後一筆的來源時間不會前進，延遲會自然變大 → 需搭配「有沒有在寫」判讀 (見 INCR_LAG_NOTE)
+  lag_of() { # 一行 -> 印出 "處理epoch 來源epoch"，抓不到回傳 1
+    local _p _e _pe _ee
+    _p=$(printf '%s' "$1" | grep -oE '^\[[0-9]{4}/[0-9]{2}/[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}' | tr -d '[')
+    _e=$(printf '%s' "$1" | grep -oE '(approximate\[|ApproximateTime:)[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}' | tail -n1 | sed -E 's/^(approximate\[|ApproximateTime:)//')
+    [ -z "$_p" ] || [ -z "$_e" ] && return 1
+    _pe=$(date -u -d "$(printf '%s' "$_p" | tr '/' '-')" +%s 2>/dev/null); _ee=$(date -u -d "$_e" +%s 2>/dev/null)
+    [ -z "$_pe" ] || [ -z "$_ee" ] && return 1
+    printf '%s %s' "$_pe" "$_ee"
+  }
+  _evlines=$(printf '%s' "$SAMPLE" | grep -E 'approximate\[|ApproximateTime:')
+  LAST_PROC_EPOCH=""; LAST_EVENT_EPOCH=""; INCR_LAG_FIRST_SEC=""
+  if [ -n "$_evlines" ]; then
+    read -r LAST_PROC_EPOCH LAST_EVENT_EPOCH <<<"$(lag_of "$(printf '%s\n' "$_evlines" | tail -n1)")"
+    if [ -n "$LAST_PROC_EPOCH" ] && [ -n "$LAST_EVENT_EPOCH" ]; then
+      INCR_LAG_SEC=$(( LAST_PROC_EPOCH - LAST_EVENT_EPOCH )); [ "$INCR_LAG_SEC" -lt 0 ] && INCR_LAG_SEC=0
+      INCR_LAG="$(human_secs "$INCR_LAG_SEC")"
     fi
+    read -r _fp _fe <<<"$(lag_of "$(printf '%s\n' "$_evlines" | head -n1)")"
+    [ -n "${_fp:-}" ] && [ -n "${_fe:-}" ] && { INCR_LAG_FIRST_SEC=$(( _fp - _fe )); [ "$INCR_LAG_FIRST_SEC" -lt 0 ] && INCR_LAG_FIRST_SEC=0; }
   fi
   # 活躍 table (取樣中事件數前 3 名)
   INCR_TABLES_DESC=$(printf '%s' "$SAMPLE" | grep -oE '(insert|update|delete|remove|modify) table\[[A-Za-z0-9_.-]+\]' \
     | sed -E 's/.*table\[([^]]+)\]/\1/' | sort | uniq -c | sort -rn | head -n3 \
     | awk '{printf "%s%s(%s)", (NR>1?"、":""), $2, $1}')
 fi
-# 階段推斷: 里程碑訊息 (start incr 等) 已隨 log 輪替消失、但取樣中有增量事件 → 增量同步中
-if [ "$STAGE" = "unknown" ] && [ "$INCR_EVENTS" -gt 0 ]; then
+# ---- [2c] CDC 讀取 / 寫入操作資訊 (增量期) ----------------------------------
+# 三個來源疊加，取得到哪個就顯示哪個 (格式皆取自 NimoShake 1.0.14 原始碼實際輸出):
+#  (1) Incr 內建 API /metric (port 9340，incr-sync/syncer.go RestAPI):
+#      records_get   = 從 DynamoDB Stream 讀到的筆數 (程序啟動後累計)
+#      records_write = 成功寫入 MongoDB 的筆數 (累計)   checkpoint_times = checkpoint 更新次數
+#      checkpoint_update_times = 各 table 進行中 shard 的 sync_approximate_time (最後寫入那筆
+#      的來源事件時間) → 「最後寫入事件距今」= CDC 追平程度 (來源無新寫入時會自然變大，屬正常)
+#  (2) log 尾端取樣 (incr-sync/syncer.go executor):
+#      "dispatcher[N] table[X] shard-id[S] try write data with length[25], tp[INSERT] ..."
+#      → 各操作型別 (INSERT/MODIFY/REMOVE) 的批數與筆數；"getRecords ... recv ... continue"
+#      = 讀取端重試 (限流/序列化/其他錯誤後自動重試)；"update table[X] shard[S] input[...] ok" = checkpoint 寫回
+#  (3) 專版 nimo-shake-starco 的增量統計行 (2026/09/07 測試機實際格式，每 5 秒一行、程序啟動後累計):
+#      "[2026/09/07 19:53:59 UTC] [INFO] [stage=incr, get=21, write_success=21, tps=0, ckpt_times=21]"
+#      get=從 Stream 讀到的筆數  write_success=寫入 MongoDB 成功筆數  tps=當下每秒寫入  ckpt_times=checkpoint 次數
+#      → 取最新一行的四個值 + 取樣區間首末差 (區間內讀了/寫了多少)；欄位名不同時退回通用抽取
+CDC_API_UP=0; CDC_API_STALE=0; CDC_API_SNAP_TIME=""; CDC_GET="-"; CDC_WRITE="-"; CDC_CKPT="-"; CDC_BACKLOG="-"
+CDC_API_LAG="-"; CDC_API_LAG_SEC=""; CDC_API_TABLES=""
+if command -v curl >/dev/null 2>&1; then
+  _mb=$(curl -sf --max-time 2 "http://localhost:${HTTP_INCR_PORT}/metric" 2>/dev/null | tr -d '\r\n')
+  CDC_API_STALE=0; CDC_API_SNAP_TIME=""
+  if [ -n "$_mb" ] && printf '%s' "$_mb" | grep -q '"records_get"'; then snap_save metric "$_mb"
+  elif _mb=$(snap_load metric) && [ -n "$_mb" ]; then CDC_API_STALE=1; CDC_API_SNAP_TIME=$(snap_time metric)
+  else _mb=""; fi
+  if [ -n "$_mb" ]; then
+    CDC_API_UP=1
+    CDC_GET=$(printf '%s' "$_mb"   | grep -oE '"records_get": *[0-9]+'      | grep -oE '[0-9]+$'); : "${CDC_GET:=0}"
+    CDC_WRITE=$(printf '%s' "$_mb" | grep -oE '"records_write": *[0-9]+'    | grep -oE '[0-9]+$'); : "${CDC_WRITE:=0}"
+    CDC_CKPT=$(printf '%s' "$_mb"  | grep -oE '"checkpoint_times": *[0-9]+' | grep -oE '[0-9]+$'); : "${CDC_CKPT:=0}"
+    CDC_BACKLOG=$(( CDC_GET - CDC_WRITE )); [ "$CDC_BACKLOG" -lt 0 ] && CDC_BACKLOG=0
+    # 各 table 進行中 shard 數: 逐字掃 checkpoint_update_times 物件 (深度1=table 名，深度2=shard id)
+    CDC_API_TABLES=$(printf '%s' "$_mb" | awk '
+      { k="\"checkpoint_update_times\":"; i=index($0,k); if(!i) exit
+        s=substr($0,i+length(k)); sub(/^ *\{/,"",s); d=1; n=0
+        while(length(s)>0 && d>0){
+          c=substr(s,1,1)
+          if(c=="\""){ q=index(substr(s,2),"\""); if(q==0) break; str=substr(s,2,q-1); s=substr(s,q+2)
+            if(d==1){ tbl=str; if(!(tbl in cnt)){cnt[tbl]=0; order[++n]=tbl} }
+            else if(d==2){ cnt[tbl]++ }
+            continue }
+          if(c=="{") d++; else if(c=="}") d--
+          s=substr(s,2) }
+        for(j=1;j<=n;j++) printf "%s%s(%d shard)", (j>1?"、":""), order[j], cnt[order[j]] }')
+    # 最後寫入事件的來源時間 (sync_approximate_time，Go time.String() 格式 "2026-09-08 06:00:00 +0000 UTC")
+    _apx=$(printf '%s' "$_mb" | grep -oE '"sync_approximate_time": *"[0-9]{4}-[0-9]{2}-[0-9]{2}[ T][0-9]{2}:[0-9]{2}:[0-9]{2}' | sed 's/.*"//' | sort | tail -n1)
+    if [ -n "$_apx" ]; then
+      _apxe=$(date -u -d "$(printf '%s' "$_apx" | tr 'T' ' ')" +%s 2>/dev/null)
+      if [ -n "$_apxe" ]; then
+        CDC_API_LAG_SEC=$(( $(date -u +%s) - _apxe )); [ "$CDC_API_LAG_SEC" -lt 0 ] && CDC_API_LAG_SEC=0
+        CDC_API_LAG=$(human_secs "$CDC_API_LAG_SEC")
+      fi
+    fi
+  fi
+fi
+CDC_W_INS=0; CDC_W_MOD=0; CDC_W_DEL=0; CDC_W_ROWS=0
+read -r CDC_W_INS CDC_W_MOD CDC_W_DEL CDC_W_ROWS <<<"$(printf '%s' "$SAMPLE" | awk '
+  /try write data with length\[/ {
+    if(match($0,/length\[[0-9]+\]/)) rows+=substr($0,RSTART+7,RLENGTH-8)
+    if($0 ~ /tp\[INSERT\]/) ins++; else if($0 ~ /tp\[MODIFY\]/) mod++; else if($0 ~ /tp\[REMOVE\]/) del++ }
+  END{ printf "%d %d %d %d", ins+0, mod+0, del+0, rows+0 }')"
+CDC_W_BATCH=$(( CDC_W_INS + CDC_W_MOD + CDC_W_DEL ))
+CDC_R_RETRY=$(printf '%s' "$SAMPLE" | grep -cE 'getRecords .* recv .* continue'); CDC_R_RETRY=${CDC_R_RETRY:-0}
+CDC_CKPT_OK=$(printf '%s' "$SAMPLE" | grep -cE 'update table\[[^]]+\] shard\[[^]]+\] input\[.*\] ok'); CDC_CKPT_OK=${CDC_CKPT_OK:-0}
+CDC_TAG_N=0; CDC_TAG_LAST=""; CDC_TAG_KV=""
+CDC_TAG_GET=""; CDC_TAG_WRITE=""; CDC_TAG_TPS=""; CDC_TAG_CKPT=""; CDC_TAG_BACKLOG=""; CDC_TAG_TIME=""
+CDC_TAG_SPAN=0; CDC_TAG_DGET=""; CDC_TAG_DWRITE=""; CDC_TAG_RATE="-"
+tag_kv() { printf '%s' "$1" | grep -oE "(^|[[, ])$2=[0-9]+" | tail -n1 | grep -oE '[0-9]+$'; }   # 行內 key=數字
+if [ -n "$INCR_TAG" ]; then
+  CDC_TAG_N=$(printf '%s' "$SAMPLE" | grep -cF -- "$INCR_TAG"); CDC_TAG_N=${CDC_TAG_N:-0}
+  if [ "$CDC_TAG_N" -gt 0 ]; then
+    _tl=$(printf '%s' "$SAMPLE" | grep -F -- "$INCR_TAG")
+    CDC_TAG_LAST=$(printf '%s' "$_tl" | tail -n1 | cut -c1-200)
+    _tf=$(printf '%s' "$_tl" | head -n1)
+    CDC_TAG_GET=$(tag_kv "$CDC_TAG_LAST" get); CDC_TAG_WRITE=$(tag_kv "$CDC_TAG_LAST" write_success)
+    CDC_TAG_TPS=$(tag_kv "$CDC_TAG_LAST" tps);  CDC_TAG_CKPT=$(tag_kv "$CDC_TAG_LAST" ckpt_times)
+    CDC_TAG_TIME=$(printf '%s' "$CDC_TAG_LAST" | grep -oE '^\[[0-9/]+ [0-9:]{8}' | grep -oE '[0-9:]{8}$')
+    if [ -n "$CDC_TAG_GET" ] && [ -n "$CDC_TAG_WRITE" ]; then
+      CDC_TAG_BACKLOG=$(( CDC_TAG_GET - CDC_TAG_WRITE )); [ "$CDC_TAG_BACKLOG" -lt 0 ] && CDC_TAG_BACKLOG=0
+      # 取樣區間首末差: 這段時間讀了/寫了多少 (累計值相減；程序重啟歸零時差值為負 → 不顯示)
+      _fg=$(tag_kv "$_tf" get); _fw=$(tag_kv "$_tf" write_success)
+      _ft=$(printf '%s' "$_tf" | grep -oE '^\[[0-9/]+ [0-9:]{8}' | grep -oE '[0-9:]{8}$')
+      if [ -n "$_fg" ] && [ -n "$_ft" ] && [ -n "$CDC_TAG_TIME" ]; then
+        _fs=$(( 10#${_ft:0:2}*3600 + 10#${_ft:3:2}*60 + 10#${_ft:6:2} ))
+        _ls=$(( 10#${CDC_TAG_TIME:0:2}*3600 + 10#${CDC_TAG_TIME:3:2}*60 + 10#${CDC_TAG_TIME:6:2} ))
+        CDC_TAG_SPAN=$(( _ls - _fs )); [ "$CDC_TAG_SPAN" -lt 0 ] && CDC_TAG_SPAN=$(( CDC_TAG_SPAN + 86400 ))
+        CDC_TAG_DGET=$(( CDC_TAG_GET - _fg )); CDC_TAG_DWRITE=$(( CDC_TAG_WRITE - ${_fw:-0} ))
+        if [ "$CDC_TAG_DGET" -lt 0 ] || [ "$CDC_TAG_DWRITE" -lt 0 ]; then CDC_TAG_DGET=""; CDC_TAG_DWRITE=""
+        elif [ "$CDC_TAG_SPAN" -gt 0 ]; then CDC_TAG_RATE=$(awk -v n="$CDC_TAG_DWRITE" -v s="$CDC_TAG_SPAN" 'BEGIN{printf "%.1f", n/s}')
+        fi
+      fi
+    else
+      # 欄位名不同 (格式再改) 時的通用抽取: key[數字] / key=數字 / key:數字，key 含 read/get/fetch/write/... 者
+      CDC_TAG_KV=$(printf '%s' "$CDC_TAG_LAST" \
+        | grep -oiE '[a-z_]*(read|get|fetch|write|insert|update|modify|delete|remove|lag|delay|tps|ckpt)[a-z_]*[=:[][0-9]+' \
+        | sed -E 's/[:[]/=/' | tr '\n' ' ' | sed 's/ $//')
+    fi
+  fi
+fi
+# 顯示條件: 取樣有寫入/專版標記，或 API 有累計數字，或已在增量階段 (量 0 也要看得到「有在等」)；全量期 API 全 0 不印
+CDC_ANY=0
+if [ "$CDC_W_BATCH" -gt 0 ] || [ "$CDC_TAG_N" -gt 0 ]; then CDC_ANY=1
+elif [ "$CDC_API_UP" -eq 1 ] && { [ "$CDC_GET" != "0" ] || [ "$CDC_WRITE" != "0" ] || [ "$HAS_INCR" -gt 0 ] || [ "$INCR_EVENTS" -gt 0 ]; }; then CDC_ANY=1
+fi
+
+# ---- 中斷 / 追趕 / 閒置 判讀 (增量期) ----
+#   中斷: 程序不在 (或 log 停寫) → 「已中斷多久」= 現在 − 最後處理時間；「資料停在」= 最後一筆的來源時間
+#   追趕: 程序在跑、取樣區間內延遲明顯縮小 (首筆延遲 − 末筆延遲 > 10 秒 且 末筆仍 > 30 秒)
+#   閒置: 延遲大但取樣內沒有寫入、專版 get 也沒增加 → 來源沒新資料，延遲數字只是等待時間
+INCR_STATE=""; INCR_LAG_NOTE=""; DISCONNECT_SEC=""
+_writing=0; { [ "$CDC_W_BATCH" -gt 0 ] || { [ -n "$CDC_TAG_DGET" ] && [ "$CDC_TAG_DGET" -gt 0 ]; }; } && _writing=1
+if [ -n "${LAST_PROC_EPOCH:-}" ]; then
+  # 中斷判定以「log 停寫」為主 (HANG_SECONDS)，避免 PROC_PATTERN 設錯時把活著的程序誤判成中斷；程序不在時放寬到 30 秒
+  if [ "$LOG_AGE" -ge "$HANG_SECONDS" ] || { [ "$PROC_RUNNING" -eq 0 ] && [ "$LOG_AGE" -ge 30 ]; }; then
+    DISCONNECT_SEC=$(( NOW - LAST_PROC_EPOCH )); [ "$DISCONNECT_SEC" -lt 0 ] && DISCONNECT_SEC=0
+    INCR_STATE="中斷"
+    INCR_LAG_NOTE="已中斷 $(human_secs "$DISCONNECT_SEC")，資料停在 $(date -u -d "@$LAST_EVENT_EPOCH" +%H:%M:%S 2>/dev/null) UTC (來源時間)，距今 $(human_secs $(( NOW - LAST_EVENT_EPOCH )))；重啟後從 checkpoint 接續"
+  elif [ -n "$INCR_LAG_FIRST_SEC" ] && [ "$INCR_LAG_SEC" -gt 30 ] && [ $(( INCR_LAG_FIRST_SEC - INCR_LAG_SEC )) -gt 10 ]; then
+    INCR_STATE="追趕中"
+    INCR_LAG_NOTE="追趕中: 取樣區間內延遲由 $(human_secs "$INCR_LAG_FIRST_SEC") 縮到 $(human_secs "$INCR_LAG_SEC")"
+  elif [ "$INCR_LAG_SEC" -ge "$STALL_SECONDS" ] && [ "$_writing" -eq 0 ]; then
+    INCR_STATE="閒置"
+    INCR_LAG_NOTE="來源近期無新資料 (取樣內無寫入、get 未增加)，延遲數字為等待時間，非落後"
+  elif [ "$INCR_LAG_SEC" -ge "$STALL_SECONDS" ]; then
+    INCR_STATE="落後"
+    INCR_LAG_NOTE="有在寫入但延遲仍 $(human_secs "$INCR_LAG_SEC")，追不上來源寫入速度"
+  else
+    INCR_STATE="追平"
+  fi
+fi
+
+# 階段推斷: 里程碑訊息 (start incr 等) 已隨 log 輪替消失、但取樣中有增量事件/專版增量標記 → 增量同步中
+if [ "$STAGE" = "unknown" ] && { [ "$INCR_EVENTS" -gt 0 ] || [ "$CDC_TAG_N" -gt 0 ]; }; then
   STAGE="增量同步中"; STAGE_SYM="◌"
 fi
 
@@ -292,15 +482,47 @@ fi
 
 # =============================================================================
 # 各 table 進度 (重量級，只在 human/json 計算)
-# 回傳多行: table<TAB>status<TAB>批次<TAB>預估筆數<TAB>耗時秒<TAB>速率<TAB>進度%<TAB>預計剩餘
-# 進度%/預計剩餘 需要 conf 設 TABLE_TOTALS="Orders:5200000,..." (基準可由 --totals 產生)，未設顯示 "-"
+# 回傳多行: table<TAB>status<TAB>批次<TAB>已搬筆數<TAB>耗時秒<TAB>速率<TAB>進度%<TAB>預計剩餘<TAB>總筆數<TAB>來源(api|log)
+# 進度%/預計剩餘 的基準 (來源總筆數):
+#   1. conf TABLE_TOTALS="Orders:5200000,..." (--totals 由上次全量 log 算出的實際筆數) 優先
+#   2. 沒設 (或缺該 table) 時自動取 NimoShake Full API /progress 的 collection_metric
+#      格式 (common/metric.go): "Orders":"1.74% (612175/35109579)" → 分母 = 來源筆數
+#      (DynamoDB DescribeTable ItemCount，AWS 約每 6 小時更新一次的概估值；全量進行中就能顯示 %)
+#   兩者皆無才顯示 "-"
 # =============================================================================
-total_for() { # table 名 -> 印出 TABLE_TOTALS 中的總筆數，查無回傳 1
-  [ -z "$TABLE_TOTALS" ] && return 1
-  printf '%s' "$TABLE_TOTALS" | tr ',' '\n' | awk -F: -v t="$1" '$1==t && $2+0>0 { print $2; f=1 } END{ exit(f?0:1) }'
+API_TOTALS=""; API_PROGRESS_BODY=""; API_PROGRESS_STALE=0; API_PROGRESS_SNAP_TIME=""
+fetch_api_totals() { # 只抓一次；成功填 API_TOTALS="Orders:35109579,Users:41"，失敗回傳 1
+  [ -n "$API_TOTALS" ] && return 0
+  command -v curl >/dev/null 2>&1 || return 1
+  API_PROGRESS_BODY=$(curl -sf --max-time 2 "http://localhost:${HTTP_FULL_PORT}/progress" 2>/dev/null | tr -d '\r\n')
+  if [ -n "$API_PROGRESS_BODY" ] && printf '%s' "$API_PROGRESS_BODY" | grep -q '"collection_metric"'; then
+    snap_save progress "$API_PROGRESS_BODY"; API_PROGRESS_STALE=0
+  elif API_PROGRESS_BODY=$(snap_load progress) && [ -n "$API_PROGRESS_BODY" ]; then
+    API_PROGRESS_STALE=1; API_PROGRESS_SNAP_TIME=$(snap_time progress)   # 程序死了 → 用中斷前最後一次抓到的
+  else
+    API_PROGRESS_BODY=""; return 1
+  fi
+  API_TOTALS=$(printf '%s' "$API_PROGRESS_BODY" | grep -oE '"[A-Za-z0-9_.-]+": *"[^"]*\([0-9]+/[0-9]+\)"' \
+    | sed -E 's#^"([^"]+)": *"[^(]*\([0-9]+/([0-9]+)\)"$#\1:\2#' | tr '\n' ',' | sed 's/,$//')
+  [ -n "$API_TOTALS" ]
+}
+total_for() { # table 名 -> 印出總筆數 (conf 優先，其次 API)，查無回傳 1
+  local src
+  for src in "$TABLE_TOTALS" "$API_TOTALS"; do
+    [ -z "$src" ] && continue
+    printf '%s' "$src" | tr ',' '\n' | awk -F: -v t="$1" '$1==t && $2+0>0 { print $2; f=1; exit } END{ exit(f?0:1) }' && return 0
+  done
+  return 1
+}
+totals_source() { # 印出基準來源說明 (報表註腳 / JSON)
+  if   [ -n "$TABLE_TOTALS" ] && [ -n "$API_TOTALS" ]; then echo "conf+api"
+  elif [ -n "$TABLE_TOTALS" ]; then echo "conf"
+  elif [ -n "$API_TOTALS" ];   then echo "api"
+  else echo "-"; fi
 }
 compute_table_stats() {
   [ -z "$TABLES" ] && return
+  fetch_api_totals >/dev/null 2>&1 || true
   while IFS= read -r tb; do
     [ -z "$tb" ] && continue
     local batches est first last dur rate status act
@@ -323,19 +545,34 @@ compute_table_stats() {
       dur=$(( ls - fs )); [ "$dur" -lt 0 ] && dur=$(( dur + 86400 ))
     fi
     if [ "$dur" -gt 0 ]; then rate=$(( est / dur )); else rate=0; fi
-    # 進度% / 預計剩餘 (需要 TABLE_TOTALS 基準)
-    local total pct="-" eta="-"
-    if total=$(total_for "$tb"); then
+    # ---- 已搬筆數 / 總筆數 / 進度%: API 在線時直接採 NimoShake 自己的統計 ----
+    # /progress 的 collection_metric 每張 table 一個字串 "1.74% (612175/35109579)" (common/metric.go)，
+    # 已搬、總數、% 都是程式即時算的，比 log 批次估算準；log 估算只在 API 打不到 (程序沒跑/離線看檔) 時用。
+    local src="log" total="" pct="-" eta="-" _cm _tot
+    _cm=$(printf '%s' "$API_PROGRESS_BODY" | grep -oE "\"$tb\": *\"[^\"]*\"" | head -n1 | sed -E 's/^"[^"]+": *"//; s/"$//')
+    if [ -n "$_cm" ] && printf '%s' "$_cm" | grep -qE '\([0-9]+/[0-9]+\)'; then
+      src="api"; [ "$API_PROGRESS_STALE" -eq 1 ] && src="stale"
+      est=$(printf '%s' "$_cm"  | sed -E 's/.*\(([0-9]+)\/[0-9]+\).*/\1/')
+      _tot=$(printf '%s' "$_cm" | sed -E 's/.*\([0-9]+\/([0-9]+)\).*/\1/')
+      pct=$(printf '%s' "$_cm"  | grep -oE '^[0-9.]+%'); : "${pct:=-}"
+      total="$_tot"
+      if [ "$dur" -gt 0 ]; then rate=$(( est / dur )); fi        # 速率 = API 已搬 ÷ log 上該 table 的活動時間
+      [ "$_tot" -gt 0 ] 2>/dev/null && [ "$est" -ge "$_tot" ] && status="完成"
+    else
+      total=$(total_for "$tb") || total=""                       # 備援: conf TABLE_TOTALS，其次上一輪抓到的 API 總數
+    fi
+    if [ -n "$total" ]; then
       if [ "$status" = "完成" ]; then
         pct="100%"
       else
-        pct=$(awk -v e="$est" -v t="$total" 'BEGIN{ p=e*100/t; if(p>100)p=100; printf "%.1f%%", p }')
-        if [ "$est" -ge "$total" ]; then eta="即將完成"
+        [ "$src" = "log" ] && pct=$(awk -v e="$est" -v t="$total" 'BEGIN{ p=e*100/t; if(p>100)p=100; printf "%.1f%%", p }')
+        if [ "$src" = "stale" ]; then eta="-"                    # 中斷中無速率可估
+        elif [ "$est" -ge "$total" ]; then eta="即將完成"
         elif [ "$rate" -gt 0 ]; then eta="$(human_secs $(( (total - est) / rate )))"
         fi
       fi
     fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$tb" "$status" "$batches" "$est" "$dur" "$rate" "$pct" "$eta"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$tb" "$status" "$batches" "$est" "$dur" "$rate" "$pct" "$eta" "${total:--}" "$src"
   done <<< "$TABLES"
 }
 
@@ -348,11 +585,12 @@ http_check() { # port -> "up"/"down"/"n/a"
   command -v curl >/dev/null 2>&1 || { echo "n/a"; return; }
   if curl -s -o /dev/null --max-time 2 "http://localhost:${port}/" 2>/dev/null; then echo "up"; else echo "down"; fi
 }
-http_fetch() { # port -> 印出 "路徑 內容摘要" (NimoShake 內建監控 API 的進度與統計；截 220 字)；無內容回傳 1
-  local port="$1" p body
+http_fetch() { # port [路徑...] -> 印出 "路徑 內容摘要" (NimoShake 內建監控 API 的進度與統計；截 220 字)；無內容回傳 1
+  local port="$1" p body; shift
   [ -z "$port" ] && return 1
   command -v curl >/dev/null 2>&1 || return 1
-  for p in /progress /metric /worker /repl /; do
+  [ $# -eq 0 ] && set -- /progress /metric /worker /repl /
+  for p in "$@"; do
     # -f: HTTP 4xx/5xx (如 404 page not found) 視為失敗，才會輪到下一個候選路徑
     body=$(curl -sf --max-time 2 "http://localhost:${port}${p}" 2>/dev/null | tr -d '\r' | tr '\n' ' ' | sed 's/  */ /g')
     if [ -n "${body// /}" ]; then
@@ -393,10 +631,17 @@ print_json() {
   printf '{'
   printf '"logfile":"%s","log_bytes":%s,"log_lines":%s,"log_age_sec":%s,' "$(json_escape "$LOGFILE")" "$LOG_BYTES" "$LOG_LINES" "$LOG_AGE"
   printf '"log_start":"%s","log_end":"%s",' "$(json_escape "${LOG_START:-}")" "$(json_escape "${LOG_END:-}")"
-  printf '"process":{"running":%s,"pid":"%s","cpu":"%s","mem_mb":"%s","threads":"%s","uptime":"%s"},' \
-    "$PROC_RUNNING" "${PROC_PID:-}" "$PROC_CPU" "$PROC_MEM_MB" "$PROC_THREADS" "$PROC_UPTIME"
+  printf '"process":{"running":%s,"pid":"%s","cpu":"%s","mem_mb":"%s","threads":"%s","uptime":"%s","starts":%s,"last_start":"%s","resume_mode":"%s"},' \
+    "$PROC_RUNNING" "${PROC_PID:-}" "$PROC_CPU" "$PROC_MEM_MB" "$PROC_THREADS" "$PROC_UPTIME" "$STARTS" "$(json_escape "$LAST_START")" "$(json_escape "$RESUME_MODE")"
   printf '"sync_mode":"%s","stage":"%s","log_activity":"%s","hang":%s,' "$SYNC_MODE" "$(json_escape "$STAGE")" "$LOG_ACTIVITY" "$HANG"
-  printf '"incr":{"events":%s,"span_sec":%s,"rate":"%s","lag":"%s","lag_sec":"%s"},' "$INCR_EVENTS" "$INCR_SPAN" "$INCR_RATE" "$(json_escape "$INCR_LAG")" "${INCR_LAG_SEC:-}"
+  printf '"incr":{"events":%s,"span_sec":%s,"rate":"%s","lag":"%s","lag_sec":"%s","lag_first_sec":"%s","state":"%s","note":"%s","disconnect_sec":"%s","last_event_epoch":"%s","last_proc_epoch":"%s",' \
+    "$INCR_EVENTS" "$INCR_SPAN" "$INCR_RATE" "$(json_escape "$INCR_LAG")" "${INCR_LAG_SEC:-}" "${INCR_LAG_FIRST_SEC:-}" "$(json_escape "$INCR_STATE")" "$(json_escape "$INCR_LAG_NOTE")" "${DISCONNECT_SEC:-}" "${LAST_EVENT_EPOCH:-}" "${LAST_PROC_EPOCH:-}"
+  printf '"cdc":{"api_up":%s,"api_stale":%s,"api_snapshot_epoch":"%s","records_get":"%s","records_write":"%s","backlog":"%s","checkpoint_times":"%s","api_tables":"%s","last_event_age":"%s","last_event_age_sec":"%s",' \
+    "$CDC_API_UP" "$CDC_API_STALE" "$CDC_API_SNAP_TIME" "$CDC_GET" "$CDC_WRITE" "$CDC_BACKLOG" "$CDC_CKPT" "$(json_escape "$CDC_API_TABLES")" "$(json_escape "$CDC_API_LAG")" "${CDC_API_LAG_SEC:-}"
+  printf '"sample_write":{"insert":%s,"modify":%s,"remove":%s,"batches":%s,"rows":%s},"sample_ckpt_ok":%s,"read_retry":%s,' \
+    "$CDC_W_INS" "$CDC_W_MOD" "$CDC_W_DEL" "$CDC_W_BATCH" "$CDC_W_ROWS" "$CDC_CKPT_OK" "$CDC_R_RETRY"
+  printf '"tag":"%s","tag_lines":%s,"tag_time":"%s","tag_get":"%s","tag_write_success":"%s","tag_backlog":"%s","tag_tps":"%s","tag_ckpt_times":"%s","tag_span_sec":%s,"tag_delta_get":"%s","tag_delta_write":"%s","tag_rate":"%s","tag_kv":"%s","tag_last":"%s"}},' \
+    "$(json_escape "$INCR_TAG")" "$CDC_TAG_N" "$CDC_TAG_TIME" "$CDC_TAG_GET" "$CDC_TAG_WRITE" "$CDC_TAG_BACKLOG" "$CDC_TAG_TPS" "$CDC_TAG_CKPT" "$CDC_TAG_SPAN" "$CDC_TAG_DGET" "$CDC_TAG_DWRITE" "$CDC_TAG_RATE" "$(json_escape "$CDC_TAG_KV")" "$(json_escape "$CDC_TAG_LAST")"
   printf '"perf":{"write":{"n":%s,"avg":%s,"min":%s,"max":%s,"p95":%s},"scan":{"n":%s,"avg":%s,"min":%s,"max":%s,"p95":%s},"parser":{"n":%s,"avg":%s,"min":%s,"max":%s,"p95":%s},"slow_write":%s,"slow_scan":%s},' \
     "$WC" "$WAVG" "$WMIN" "$WMAX" "$WP95" "$SC" "$SAVG" "$SMIN" "$SMAX" "$SP95" "$PC" "$PAVG" "$PMIN" "$PMAX" "$PP95" "$SLOW_W" "$SLOW_S"
   printf '"bottleneck":"%s",' "$(json_escape "$BOTTLENECK")"
@@ -406,13 +651,16 @@ print_json() {
     "$HTTP_FULL_PORT" "$(http_check "$HTTP_FULL_PORT")" "$HTTP_INCR_PORT" "$(http_check "$HTTP_INCR_PORT")" "$HTTP_PPROF_PORT" "$(http_check "$HTTP_PPROF_PORT")"
   printf '"system":{"cores":"%s","load":"%s","mem":"%s","disk":"%s"},' \
     "$SYS_CORES" "$(json_escape "$SYS_LOAD")" "$(json_escape "$SYS_MEM")" "$(json_escape "$SYS_DISK")"
+  local _tbl_rows; _tbl_rows=$(compute_table_stats)
+  fetch_api_totals >/dev/null 2>&1 || true
+  printf '"totals_source":"%s","api_totals":"%s","api_progress_stale":%s,"api_progress_snapshot_epoch":"%s",' "$(totals_source)" "$(json_escape "$API_TOTALS")" "$API_PROGRESS_STALE" "$API_PROGRESS_SNAP_TIME"
   printf '"tables":['
-  while IFS=$'\t' read -r tb st ba es du ra pc et; do
+  while IFS=$'\t' read -r tb st ba es du ra pc et tt sr; do
     [ -z "$tb" ] && continue
     [ $first -eq 0 ] && printf ','; first=0
-    printf '{"table":"%s","status":"%s","batches":%s,"est_rows":%s,"dur_sec":%s,"rate":%s,"pct":"%s","eta":"%s"}' \
-      "$(json_escape "$tb")" "$(json_escape "$st")" "${ba:-0}" "${es:-0}" "${du:-0}" "${ra:-0}" "$(json_escape "${pc:--}")" "$(json_escape "${et:--}")"
-  done <<< "$(compute_table_stats)"
+    printf '{"table":"%s","status":"%s","batches":%s,"est_rows":%s,"dur_sec":%s,"rate":%s,"pct":"%s","eta":"%s","total":"%s","source":"%s"}' \
+      "$(json_escape "$tb")" "$(json_escape "$st")" "${ba:-0}" "${es:-0}" "${du:-0}" "${ra:-0}" "$(json_escape "${pc:--}")" "$(json_escape "${et:--}")" "${tt:--}" "${sr:-log}"
+  done <<< "$_tbl_rows"
   printf '],'
   first=1
   printf '"conditions":['
@@ -451,20 +699,60 @@ print_human() {
   else echo -e "   ${RED}● 未運行${R}"; fi
   echo -e "${B}[2] 同步階段${R}"
   echo -e "   模式: $SYNC_MODE   階段: $STAGE_SYM $STAGE"
+  if [ "$STARTS" -gt 0 ]; then
+    echo -e "   啟動: 本檔 ${STARTS} 次，最近 ${LAST_START:-?} UTC${RESUME_MODE:+ → ${RESUME_MODE}}"
+  fi
   if [ "$INCR_EVENTS" -gt 0 ]; then
-    echo -e "   增量: 近 ${SCAN_TAIL_LINES} 行取樣 ${INCR_EVENTS} 筆事件 (~${INCR_RATE} 筆/s)  同步延遲: ${INCR_LAG}"
+    echo -e "   增量: 近 ${SCAN_TAIL_LINES} 行取樣 ${INCR_EVENTS} 筆事件 (~${INCR_RATE} 筆/s)  資料延遲: ${INCR_LAG}${INCR_STATE:+ [${INCR_STATE}]}"
     [ -n "$INCR_TABLES_DESC" ] && echo -e "   活躍 table: $INCR_TABLES_DESC"
+  fi
+  if [ -n "$INCR_LAG_NOTE" ]; then
+    if [ "$INCR_STATE" = "中斷" ] || [ "$INCR_STATE" = "落後" ]; then echo -e "   ${RED}⚠ ${INCR_LAG_NOTE}${R}"
+    else echo -e "   ${DIM}(${INCR_LAG_NOTE})${R}"; fi
+  fi
+  # CDC 讀取/寫入操作資訊 (增量期才有資料；全量期三來源皆空則整段不印)
+  if [ "$CDC_ANY" -eq 1 ]; then
+    if [ "$CDC_API_UP" -eq 1 ] && [ "$CDC_API_STALE" -eq 1 ]; then
+      echo -e "   ${Y}CDC 中斷前最後值 (API 快照 $(date -u -d "@$CDC_API_SNAP_TIME" +%H:%M:%S 2>/dev/null) UTC): 讀取 ${CDC_GET} 筆   寫入 ${CDC_WRITE} 筆   待寫 ${CDC_BACKLOG}   checkpoint ${CDC_CKPT} 次${R}"
+      [ -n "$CDC_API_TABLES" ] && echo -e "   CDC 中斷前進行中 shard: ${CDC_API_TABLES}   最後寫入事件距今: ${CDC_API_LAG} (持續變大直到重啟接續)"
+    elif [ "$CDC_API_UP" -eq 1 ]; then
+      echo -e "   CDC 讀取: ${CDC_GET} 筆   寫入: ${CDC_WRITE} 筆   待寫(讀-寫): ${CDC_BACKLOG}   checkpoint 更新: ${CDC_CKPT} 次  ${DIM}(Incr API /metric，程序啟動後累計)${R}"
+      [ -n "$CDC_API_TABLES" ] && echo -e "   CDC 進行中 shard: ${CDC_API_TABLES}   最後寫入事件距今: ${CDC_API_LAG}"
+    else
+      echo -e "   ${DIM}CDC 累計 (Incr API ${HTTP_INCR_PORT}/metric): 端點未回應，只能看取樣${R}"
+    fi
+    echo -e "   CDC 寫入取樣 (近 ${SCAN_TAIL_LINES} 行): INSERT ${CDC_W_INS} 批  MODIFY ${CDC_W_MOD} 批  REMOVE ${CDC_W_DEL} 批  共 ${CDC_W_ROWS} 筆   checkpoint 寫回 ${CDC_CKPT_OK} 次   讀取重試 ${CDC_R_RETRY} 次"
+    if [ "$CDC_TAG_N" -gt 0 ]; then
+      if [ -n "$CDC_TAG_GET" ]; then
+        echo -e "   CDC 專版統計 [${INCR_TAG}] 最新 ${CDC_TAG_TIME:-?}: 讀取 get=${CDC_TAG_GET}  寫入 write_success=${CDC_TAG_WRITE}  待寫 ${CDC_TAG_BACKLOG}  tps=${CDC_TAG_TPS:--}  checkpoint=${CDC_TAG_CKPT:--}"
+        [ -n "$CDC_TAG_DGET" ] && echo -e "   ${DIM}(取樣 ${CDC_TAG_N} 行、區間 $(human_secs "$CDC_TAG_SPAN"): 讀取 +${CDC_TAG_DGET} 筆、寫入 +${CDC_TAG_DWRITE} 筆 (~${CDC_TAG_RATE} 筆/s)；log 每 5 秒一行，數值為程序啟動後累計)${R}"
+      else
+        echo -e "   [專版] ${INCR_TAG} 取樣 ${CDC_TAG_N} 行${CDC_TAG_KV:+  欄位: ${CDC_TAG_KV}}"
+        echo -e "   ${DIM}最新: ${CDC_TAG_LAST}${R}"
+      fi
+    fi
   fi
   [ "$HANG" -eq 1 ] && echo -e "   ${RED}⚠ 疑似假死: 程序在但 log 停止寫入${R}"
   echo -e "${B}[3] Table 進度${R}"
   if [ -n "$TABLES" ]; then
-    printf "   %-16s %-12s %10s %14s %10s %10s %8s %12s\n" "Table" "狀態" "批次" "預估筆數" "耗時(s)" "速率/s" "進度%" "預計剩餘"
-    while IFS=$'\t' read -r tb st ba es du ra pc et; do
+    printf "   %-16s %-12s %10s %14s %10s %10s %8s %12s %14s\n" "Table" "狀態" "批次" "已搬筆數" "耗時(s)" "速率/s" "進度%" "預計剩餘" "總筆數"
+    local _tbl_rows _any_api=0 _any_log=0; _tbl_rows=$(compute_table_stats)
+    fetch_api_totals >/dev/null 2>&1 || true
+    local _any_stale=0 _remain=""
+    while IFS=$'\t' read -r tb st ba es du ra pc et tt sr; do
       [ -z "$tb" ] && continue
-      printf "   %-16s %-12s %10s %14s %10s %10s %8s %12s\n" "$tb" "$st" "$ba" "$es" "$du" "$ra" "${pc:--}" "${et:--}"
-    done <<< "$(compute_table_stats)"
-    echo -e "   ${DIM}(每批大小 batch=${BATCH_SIZE}，預估筆數 = 批次 × batch)${R}"
-    [ -z "$TABLE_TOTALS" ] && echo -e "   ${DIM}(進度%/預計剩餘 需在 conf 設 TABLE_TOTALS 基準，可用 --totals 從上次全量 log 產生)${R}"
+      case "$sr" in api) _any_api=1 ;; stale) _any_stale=1; [ "$st" != "完成" ] && [ "$tt" != "-" ] && _remain+="${tb} 還差 $(( tt - es )) 筆、" ;; *) _any_log=1 ;; esac
+      printf "   %-16s %-12s %10s %14s %10s %10s %8s %12s %14s\n" "$tb" "$st" "$ba" "$es" "$du" "$ra" "${pc:--}" "${et:--}" "${tt:--}"
+    done <<< "$_tbl_rows"
+    [ "$_any_api" -eq 1 ] && echo -e "   ${DIM}(已搬筆數/總筆數/進度% 取自 NimoShake API ${HTTP_FULL_PORT}/progress 即時統計；批次為 log 計數，速率 = 已搬 ÷ 活動時間)${R}"
+    [ "$_any_stale" -eq 1 ] && echo -e "   ${Y}(API 未回應，顯示中斷前最後值，快照時間 $(date -u -d "@$API_PROGRESS_SNAP_TIME" +%H:%M:%S 2>/dev/null) UTC${_remain:+；${_remain%、}}；全量無斷點續傳，重啟會從頭)${R}"
+    if [ "$_any_log" -eq 1 ]; then
+      echo -e "   ${DIM}(API 未回應的 table 以 log 估算: 已搬筆數 = 批次 × batch(${BATCH_SIZE}))${R}"
+      case "$(totals_source)" in
+        api|conf+api|conf) echo -e "   ${DIM}(其進度% 基準:${TABLE_TOTALS:+ conf=$TABLE_TOTALS}${API_TOTALS:+ api=$API_TOTALS})${R}" ;;
+        *) echo -e "   ${DIM}(進度%/預計剩餘 需要總筆數: 程序在跑時自動取 API ${HTTP_FULL_PORT}/progress；離線看檔可在 conf 設 TABLE_TOTALS，用 --totals 從上次全量 log 產生)${R}" ;;
+      esac
+    fi
     [ "$INCR_EVENTS" -gt 0 ] && echo -e "   ${DIM}(增量期逐筆事件同步，全量批次數字僅為本檔歷史；增量現況見 [2])${R}"
   else echo -e "   ${DIM}(log 中未偵測到 table)${R}"; fi
   echo -e "${B}[4] 效能 (近 ${SCAN_TAIL_LINES} 行取樣)${R}"
@@ -486,7 +774,7 @@ print_human() {
   printf "   Full(%s):%s  Incr(%s):%s  PProf(%s):%s\n" \
     "$HTTP_FULL_PORT" "$_fs" "$HTTP_INCR_PORT" "$_is" "$HTTP_PPROF_PORT" "$_ps"
   [ "$_fs" = "up" ] && _fb=$(http_fetch "$HTTP_FULL_PORT") && echo -e "   ${DIM}Full${_fb}${R}"
-  [ "$_is" = "up" ] && _ib=$(http_fetch "$HTTP_INCR_PORT") && echo -e "   ${DIM}Incr${_ib}${R}"
+  [ "$_is" = "up" ] && _ib=$(http_fetch "$HTTP_INCR_PORT" /metric /progress /worker /repl /) && echo -e "   ${DIM}Incr${_ib}${R}"   # incr port 的 /progress 只回路由清單，先抓 /metric
   echo -e "${B}[8] 系統資源${R}"
   echo -e "   CPU核心:$SYS_CORES  負載:$SYS_LOAD  記憶體:$SYS_MEM"
   echo -e "   磁碟(log所在):$SYS_DISK"
@@ -519,32 +807,52 @@ print_summary() {
     echo "bad|程式狀態|未運行 (log 最後寫入於 $(human_secs "$LOG_AGE") 前)"
   fi
 
-  # 2) 同步階段
+  # 2) 同步階段 (+ 啟動次數 / 續傳方式)
+  local _st_extra=""; [ "$STARTS" -gt 0 ] && _st_extra="；本檔啟動 ${STARTS} 次，最近 ${LAST_START:-?} UTC${RESUME_MODE:+ → ${RESUME_MODE}}"
   if [ "$STAGE" = "已停止" ] || { [ "$PROC_RUNNING" -eq 0 ] && [ "$HAS_FULL_DONE" -eq 0 ] && [ "$HAS_START_SYNC" -gt 0 ]; }; then
-    echo "bad|同步階段|$STAGE (全量未完成即中止，重啟會從頭開始)"
+    echo "bad|同步階段|$STAGE (全量未完成即中止，重啟會從頭開始)${_st_extra}"
   else
-    echo "ok|同步階段|$STAGE (模式: $SYNC_MODE)"
+    echo "ok|同步階段|$STAGE (模式: $SYNC_MODE)${_st_extra}"
   fi
 
-  # 2.5) 增量同步 (取樣中有增量事件才顯示)；延遲超過 STALL_SECONDS 視為異常
+  # 2.5) 增量同步 (取樣中有增量事件才顯示)
+  #   異常 = 中斷 (程序不在/log 停寫) 或 落後 (有在寫但延遲仍超過 STALL_SECONDS)；閒置 (來源無新資料) 不算異常
   if [ "$INCR_EVENTS" -gt 0 ]; then
-    if [ -n "$INCR_LAG_SEC" ] && [ "$INCR_LAG_SEC" -ge "$STALL_SECONDS" ]; then
-      echo "bad|增量同步|同步延遲 ${INCR_LAG} 超過門檻 $(human_secs "$STALL_SECONDS")；近取樣 ${INCR_EVENTS} 筆 (~${INCR_RATE} 筆/s)"
-    else
-      echo "ok|增量同步|近取樣 ${INCR_EVENTS} 筆事件 (~${INCR_RATE} 筆/s)，同步延遲 ${INCR_LAG}${INCR_TABLES_DESC:+；活躍: ${INCR_TABLES_DESC}}"
+    case "$INCR_STATE" in
+      中斷|落後) echo "bad|增量同步|${INCR_LAG_NOTE}；近取樣 ${INCR_EVENTS} 筆 (~${INCR_RATE} 筆/s)" ;;
+      *) echo "ok|增量同步|近取樣 ${INCR_EVENTS} 筆事件 (~${INCR_RATE} 筆/s)，資料延遲 ${INCR_LAG}${INCR_STATE:+ [${INCR_STATE}]}${INCR_TABLES_DESC:+；活躍: ${INCR_TABLES_DESC}}${INCR_LAG_NOTE:+；${INCR_LAG_NOTE}}" ;;
+    esac
+  fi
+
+  # 2.6) CDC 讀寫 (增量期才有；三來源皆無資料時不印)。純資訊列不判異常:
+  #      「最後寫入事件距今」在來源本來就沒新寫入時會自然變大，不能當停滯依據 (停滯由假死/Log 活躍度判)
+  if [ "$CDC_ANY" -eq 1 ]; then
+    local _cd=""
+    if [ "$CDC_API_UP" -eq 1 ] && [ "$CDC_API_STALE" -eq 1 ]; then _cd+="中斷前最後值 (API 快照 $(date -u -d "@$CDC_API_SNAP_TIME" +%H:%M:%S 2>/dev/null) UTC): 讀取 ${CDC_GET}／寫入 ${CDC_WRITE}／待寫 ${CDC_BACKLOG}${CDC_API_LAG_SEC:+，最後寫入事件距今 ${CDC_API_LAG}}；"
+    elif [ "$CDC_API_UP" -eq 1 ]; then _cd+="讀取 ${CDC_GET} 筆／寫入 ${CDC_WRITE} 筆／待寫 ${CDC_BACKLOG} (API 累計，checkpoint ${CDC_CKPT} 次${CDC_API_LAG_SEC:+，最後寫入事件距今 ${CDC_API_LAG}})；"
     fi
+    [ "$CDC_W_BATCH" -gt 0 ] && _cd+="近取樣寫入 INSERT ${CDC_W_INS}／MODIFY ${CDC_W_MOD}／REMOVE ${CDC_W_DEL} 批 共 ${CDC_W_ROWS} 筆；"
+    [ "$CDC_R_RETRY" -gt 0 ] && _cd+="讀取重試 ${CDC_R_RETRY} 次；"
+    if [ "$CDC_TAG_N" -gt 0 ]; then
+      if [ -n "$CDC_TAG_GET" ]; then _cd+="專版 log 最新 ${CDC_TAG_TIME:-?}: 讀取 ${CDC_TAG_GET}／寫入 ${CDC_TAG_WRITE}／待寫 ${CDC_TAG_BACKLOG}／tps ${CDC_TAG_TPS:--}／checkpoint ${CDC_TAG_CKPT:--}${CDC_TAG_DGET:+ (近 $(human_secs "$CDC_TAG_SPAN") 讀 +${CDC_TAG_DGET}、寫 +${CDC_TAG_DWRITE})}；"
+      else _cd+="專版 ${INCR_TAG} ${CDC_TAG_N} 行${CDC_TAG_KV:+ (${CDC_TAG_KV})}；"
+      fi
+    fi
+    echo "ok|CDC 讀寫|${_cd%；}"
   fi
 
   # 3) Table 進度: 逐張判讀 (含名稱/筆數)，未完成且程序已不在 = 中斷(異常)
   if [ -n "$TABLES" ]; then
     local t_done=0 t_done_desc="" t_bad="" t_run=""
-    while IFS=$'\t' read -r tb st ba es du ra pc et; do
+    while IFS=$'\t' read -r tb st ba es du ra pc et tt sr; do
       [ -z "$tb" ] && continue
       local _p=""; [ -n "$pc" ] && [ "$pc" != "-" ] && _p=" ${pc}"
+      local _t=""; [ -n "$tt" ] && [ "$tt" != "-" ] && _t="/${tt}"
       local _e=""; [ -n "$et" ] && [ "$et" != "-" ] && _e="，預計剩餘 ${et}"
-      if [ "$st" = "完成" ]; then t_done=$((t_done+1)); t_done_desc+="${tb}(~${es} 筆)、"
-      elif [ "$PROC_RUNNING" -eq 0 ]; then t_bad+="${tb} 中斷於約 ${es} 筆${_p} (${ba} 批)；"
-      else t_run+="${tb} 進行中約 ${es} 筆${_p} (速率 ${ra} 筆/s${_e})；"
+      local _ab="約 "; { [ "$sr" = "api" ] || [ "$sr" = "stale" ]; } && _ab=" "   # API 數字 (含快照) 是精確值，不加「約」
+      if [ "$st" = "完成" ]; then t_done=$((t_done+1)); t_done_desc+="${tb}(${_ab% }${es} 筆)、"
+      elif [ "$PROC_RUNNING" -eq 0 ]; then t_bad+="${tb} 中斷於${_ab}${es}${_t} 筆${_p} (${ba} 批$( [ "$sr" = "stale" ] && [ "$tt" != "-" ] && printf '，還差 %s 筆' "$(( tt - es ))" ))；"
+      else t_run+="${tb} 進行中${_ab}${es}${_t} 筆${_p} (速率 ${ra} 筆/s${_e})；"
       fi
     done <<< "$(compute_table_stats)"
     t_done_desc="${t_done_desc%、}"
@@ -621,5 +929,13 @@ case "$MODE" in
   human)      print_human ;;
   watch)      # 每輪重新執行本腳本重算，才是真的刷新 (變數在頂部只算一次，直接重印會是舊值)
               # 目標帶 conf 原路徑 (若有)，讓 TABLE_TOTALS/門檻/port 等 conf 設定每輪重新套用
-              while true; do clear 2>/dev/null || true; bash "$0" --human "${CONF_PATH:-$LOGFILE}"; echo "(每 ${WATCH_INTERVAL}s 刷新，Ctrl-C 結束)"; sleep "$WATCH_INTERVAL"; done ;;
+              # trap: Ctrl-C / kill 時收乾淨地離開，不留半張報表；sleep 放背景 + wait 讓訊號即時生效
+              trap 'printf "\n(監控結束)\n"; exit 0' INT TERM
+              while true; do
+                _out=$(bash "$0" --human "${CONF_PATH:-$LOGFILE}" 2>&1)   # 先在背後算完，再一次清屏重印，畫面不閃爍
+                clear 2>/dev/null || printf '\033[2J\033[H'
+                printf '%s\n' "$_out"
+                echo "(每 ${WATCH_INTERVAL}s 刷新，Ctrl-C 結束；要單次報表請加 --human)"
+                sleep "$WATCH_INTERVAL" & wait $! || true
+              done ;;
 esac

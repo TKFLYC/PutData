@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# nimoshake-alert.sh  v1.4 — NimoShake 監控告警引擎 (SendGrid)
+# nimoshake-alert.sh  v1.5 — NimoShake 監控告警引擎 (SendGrid)
 # -----------------------------------------------------------------------------
 # 設計給「每分鐘一次 cron」使用，重點在「不亂寄、不重複寄」:
 #   1. 狀態機:  新增(NEW) / 未解除(FIRING) / 已解除(RESOLVED)
@@ -120,6 +120,7 @@ else
     NS_SCAN_TAIL_LINES="${SCAN_TAIL_LINES:-2000}" \
     NS_EXPECT_RUNNING="${EXPECT_RUNNING:-0}" NS_PROC_PATTERN="$PROC_PATTERN" \
     NS_TABLE_TOTALS="${TABLE_TOTALS:-}" \
+    NS_HTTP_FULL_PORT="${HTTP_FULL_PORT:-}" NS_HTTP_INCR_PORT="${HTTP_INCR_PORT:-}" NS_INCR_TAG="${INCR_TAG:-}" NS_STATE_DIR="$STATE_DIR" \
     bash "$MONITOR" --conditions "$LOG_FILE"
   ) || true
   # monitor 正常時至少會輸出 ALL_CLEAR；輸出為空代表 monitor 失敗 (如 -r 檢查後
@@ -720,6 +721,7 @@ if [ -n "$NEW_LIST$FIRING_LIST" ] && [ -r "$LOG_FILE" ]; then
             NS_EXPECT_RUNNING="${EXPECT_RUNNING:-0}" NS_PROC_PATTERN="$PROC_PATTERN" \
             NS_DISK_ALERT_PCT="${DISK_ALERT_PCT:-85}" NS_MEM_ALERT_PCT="${MEM_ALERT_PCT:-90}" \
             NS_TABLE_TOTALS="${TABLE_TOTALS:-}" \
+    NS_HTTP_FULL_PORT="${HTTP_FULL_PORT:-}" NS_HTTP_INCR_PORT="${HTTP_INCR_PORT:-}" NS_INCR_TAG="${INCR_TAG:-}" NS_STATE_DIR="$STATE_DIR" \
             bash "$MONITOR" --summary "$LOG_FILE" 2>/dev/null)
   if [ -n "$SUMMARY" ]; then
     SNAPSHOT=$'\n【系統狀態判讀】\n'

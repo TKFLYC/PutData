@@ -1,11 +1,36 @@
-NimoShake 監控告警 — 賣貨便 (MyShip) 環境 (2026/08/31 v4.2)
+NimoShake 監控告警 — 賣貨便 (MyShip) 環境 (2026/09/08 v4.3)
 ==========================================================
 
 本包為 賣貨便 (MyShip) 專用，不含任何金鑰。
 發信人固定 c2cteam@pic.net.tw，收件人於 conf 設定。
 
-本版更新 (v4.2)
+本版更新 (v4.3)
 -------------
+- Table 進度直接採 NimoShake 即時統計: 程序在跑時，報表 [3] 的已搬筆數/總筆數/進度%/預計剩餘
+  直接取自 NimoShake 內建 API (localhost:9341/progress)，不用設 TABLE_TOTALS、不用設任何東西。
+  09/03 畫面上 [3] 顯示 "-" 是舊版只認 conf 基準、沒去讀 API；升級後同畫面會顯示 1.74%、612175/35109579。
+  API 打不到 (程序沒跑、離線看歷史 log) 才退回 log 估算 + conf TABLE_TOTALS。
+- CDC (增量) 讀取/寫入操作資訊: 報表 [2] 與告警信判讀表新增「CDC 讀寫」列，三個來源疊加——
+  (1) NimoShake 增量 API 9340/metric 的累計讀取/寫入/待寫/checkpoint 次數；
+  (2) log 取樣的 INSERT/MODIFY/REMOVE 批數與筆數、讀取重試次數；
+  (3) 專版每 5 秒一行的統計行 [stage=incr, get=N, write_success=N, tps=N, ckpt_times=N]:
+      顯示最新一行的 讀取 get / 寫入 write_success / 待寫 / tps / checkpoint，以及取樣區間內讀了寫了多少。
+  純資訊列，不新增告警條件。
+  注意: 實際 log 字樣是 stage=incr (等號)，手動 grep 請用 grep "stage=incr"；用 stage-incr 會抓不到。
+- 中斷/續傳/追趕判讀 (常駐畫面 [2] 與告警信): 顯示「本檔啟動 N 次，最近 HH:MM → 從 checkpoint 續傳增量 / 重跑全量」；
+  資料延遲加狀態標籤 [追平/追趕中/閒置/落後/中斷]；斷線時直接印「已中斷 X，資料停在 HH:MM:SS(來源時間)，距今 Y」，
+  重啟接續後印「追趕中: 延遲由 A 縮到 B」。程序死掉 API 消失時，[3] 已搬/總數/進度% 與 CDC 累計改顯示
+  中斷前最後值 (state/.api_snapshot 快照) 並加註「還差 N 筆」，不再變成 "-"。
+- 修正: 舊版「同步延遲」永遠顯示 0 秒 (拿 checkpoint 寫入時間比行時間，兩者都是當下)。
+  新版改用來源事件時間 (DynamoDB Stream 的 ApproximateCreationDateTime)，顯示的是真實資料延遲。
+  來源沒新資料時延遲會自然變大，畫面會標 [閒置] 不算異常；有在寫但延遲超過 STALL_SECONDS 才標 [落後] 異常。
+- conf 新增選填參數 (見 myship.conf.example): HTTP_FULL_PORT / HTTP_INCR_PORT (API 端口不是預設時才設)、INCR_TAG (預設 stage=incr)。
+- 升級方式: 覆蓋 myship-monitor 資料夾內的 nimoshake-monitor.sh、nimoshake-alert.sh 即可，既有 conf 不用改。
+前版更新 (v4.2；09/01 文件補充，程式不變)
+-------------
+- (09/01) 補充「看門狗驗證」與「告警頻率說明」兩節 (見本檔下方)；
+  交付文件同步新增 2.1.2 嚴重度分級定義、2.1.3 提醒頻率 (REALERT_INTERVAL) 說明、
+  2.7.1 看門狗設定與驗證步驟。
 - 新增「FullCheck 結束通知」: 在 conf 加一行 FULLCHECK_DIR (nimo-full-check.linux 的執行目錄) 後，
   nimo-full-check 全量複核照原本指令跑完 (輸出資料夾出現 run-manifest.json) 1 分鐘內自動寄結果信:
   🟢 PASS / 🟠 PASS_WITH_EXCEPTIONS / 🔴 FAIL + 各 table 統計 (checked/passed/failed/exceptions) +
@@ -84,6 +109,34 @@ myship-monitor/                       程式碼資料夾 — 整個資料夾上�
 
 4. 預設 DRY_RUN=1 只寫 state/alert.log 不寄信，觀察數日確認判斷正確後，
    把 myship.conf 的 DRY_RUN 改 0 正式啟用。
+
+看門狗驗證 (建議上線前做一次)
+-----------------------------
+看門狗 (nimoshake-watchdog.sh) 負責「告警引擎自己壞掉」時發信。設定不需額外動作:
+排程行已在 crontab.example (*/5 那行)，照步驟 3 貼入即生效，conf 不需加任何參數。
+驗證三步:
+1. sudo crontab -l 應看到 nimoshake-watchdog.sh 那行 (每 5 分鐘)。
+2. 手動跑一次: sudo bash nimoshake-watchdog.sh myship.conf
+   —— 心跳正常時「靜默結束、無輸出」是正常的 (state/watchdog.log 平時是空的)。
+3. 實測會發信: 暫時把 crontab 裡「告警引擎」那行註解掉 (保留看門狗行)，
+   5-10 分鐘內應收到 🔴「監控引擎停擺 (告警失效中)」；
+   取消註解恢復後，5 分鐘內會再收到 🟢「監控引擎已恢復」。
+注意: 看門狗同樣尊重 DRY_RUN —— conf 是 DRY_RUN=1 時只記 watchdog.log 不真寄，
+實測前 conf 需已改 DRY_RUN=0。上線時 DRY_RUN 改 0 一次，引擎與看門狗一起生效。
+
+告警頻率說明 (為什麼第一封之後沒再寄?)
+--------------------------------------
+設計是「同一問題只通知一次、不重複轟炸」: 問題新增時寄 🔴 一封，之後持續存在
+預設每 6 小時 (REALERT_INTERVAL=21600) 才寄一封 🟠 提醒，解除時寄 🟢 一封。
+中間每分鐘的檢查都只在 state/alert.log 記一行「OK: 本次無需寄信」——這是正常的，
+不是排程卡住。確認沒卡住的方法:
+  sudo tail -20 state/alert.log    # 每分鐘應有一行
+  sudo cat state/.heartbeat        # 心跳時間戳應在 1 分鐘內
+另注意: 若第一封是用 --send 手動寄的、而排程 conf 仍是 DRY_RUN=1，
+也會呈現「第一封有、之後都沒有」，查 alert.log 有無「DRY_RUN: 略過寄信」即可分辨。
+想提醒更頻繁: conf 的 REALERT_INTERVAL 調小 (例 3600=每小時；0=不重複提醒)。
+嚴重度分級: high/medium 會寄信，low (慢讀寫) 預設只記錄不寄
+(ALERT_MIN_SEVERITY=medium，要收 low 改設 low)。詳見交付文件 2.1.2 / 2.1.3。
 
 部署後自我檢查
 --------------

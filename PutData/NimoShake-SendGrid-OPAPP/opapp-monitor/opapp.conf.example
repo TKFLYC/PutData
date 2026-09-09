@@ -49,6 +49,40 @@ PROC_PATTERN="(^|/)nimo-shake(\.(linux|darwin))?( |$)"  # pgrep -f 用的錨定 
 # 設定各 table 來源總筆數後，報表 [3] 會顯示 進度% 與 預計剩餘時間。
 # 基準值可由「上次完成的全量 log」一鍵產生:  bash nimoshake-monitor.sh --totals /path/to/舊全量log
 # TABLE_TOTALS="Orders:5200000,Users:130000"
+# (v4.3) 沒設 TABLE_TOTALS 時，全量進行中會自動向 NimoShake 內建 API (localhost:9341/progress) 取
+#        各 table 來源筆數當基準 (DynamoDB ItemCount 概估)，不用手動填也有進度%；有設的 table 以這裡為準。
+# ---- NimoShake 內建監控 API 端口 (選填；與 nimo-shake.conf 的 full_sync.http_port / incr_sync.http_port 一致) ----
+# HTTP_FULL_PORT=9341       # 全量進度 API (/progress)，[3] 進度% 自動基準的來源
+# HTTP_INCR_PORT=9340       # 增量統計 API (/metric)，[2] CDC 讀取/寫入累計的來源
+# ---- CDC (增量) 專版統計行字樣 (選填) ----
+# 專版 nimo-shake-starco 增量階段每 5 秒寫一行累計統計:
+#   [2026/09/07 19:53:59 UTC] [INFO] [stage=incr, get=21, write_success=21, tps=0, ckpt_times=21]
+# 監控會取最新一行的 get(讀取)/write_success(寫入)/tps/ckpt_times 與取樣區間增量顯示在 [2]。
+# 注意實際字樣是 stage=incr (等號)；grep 時請用 grep "stage=incr"。字樣改版時在此修改。
+# INCR_TAG="stage=incr"
+
+# ---- FullCheck 結束通知 (選填) ----
+# 設定後，nimo-full-check 全量複核跑完 (輸出資料夾出現 run-manifest.json)
+# 1 分鐘內自動寄結果信: outcome (PASS/PASS_WITH_EXCEPTIONS/FAIL)、各 table
+# 統計 (checked/passed/failed/exceptions)、耗時。fullcheck 照原本指令跑即可。
+# 失敗也會通知: 程序消失卻沒有新結果檔 (OOM/kill/斷線) → 🔴 異常結束告警。
+# 填 nimo-full-check.linux 的「執行目錄」(輸出資料夾 -d 通常在其下一層)，
+# 可逗號分隔多個。首次啟用只建基準，不會補寄歷史結果；同一次結果只通知一次。
+# FULLCHECK_DIR="/home/ForTest_NimoShakeStarCoVersion/nimo-shake-starco-1.0.14-sc.20260818"
+# FULLCHECK_PROC_PATTERN="(^|/)nimo-full-check(\.(linux|darwin))?( |$)"  # 程序比對 regex，執行檔改名才需調整
+# --- 原生版環境專用: 機器上的 fullcheck 是原生 git 版時才設 ---
+# 原生版不寫 run-manifest.json，判別改用「程序結束 + 讀輸出資料夾 diff 檔」。
+# 此時 FULLCHECK_DIR 請直接填 -d 輸出資料夾本身 (單一路徑)。
+# FULLCHECK_MODE="native"
+# FULLCHECK_NATIVE_LOG="/path/to/fullcheck.log"  # (建議) 啟動時導出的 log 檔
+#     (nohup ./nimo-full-check ... > fullcheck.log 2>&1)，用於區分跑完/中途掛掉；
+#     不設則程序消失一律視為跑完
+
+# ---- 看門狗 (監控引擎自我監控) ----
+# nimoshake-watchdog.sh 由 cron 每 5 分鐘獨立執行 (見 crontab.example)，
+# 檢查引擎心跳 (state/.heartbeat)，停更即寄「🔴 監控引擎停擺」、恢復寄 🟢。
+# WATCHDOG_STALE_SECONDS=300      # 心跳落後幾秒視為停擺 (預設 5 分鐘)
+# WATCHDOG_REALERT_SECONDS=21600  # 停擺未恢復多久提醒一次 (預設 6 小時)
 
 # ---- 系統資源判讀門檻 (附在告警信的「系統狀態判讀」表) ----
 DISK_ALERT_PCT=85         # 磁碟使用率超過此 % 判為異常
