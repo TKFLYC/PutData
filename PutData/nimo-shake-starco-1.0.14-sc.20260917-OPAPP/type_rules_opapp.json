@@ -1,0 +1,98 @@
+{
+  "schema_version": 2,
+  "config_id": "opapp.type-conversion",
+  "config_version": "2026-09-11.1",
+  "description": "Test-only OPAPP contract derived from the frozen FIELDS fixture",
+  "scope": {"database": "REPLACE_WITH_SAME_TARGET_DATABASE_ID"},
+  "source_id_fields": 0,
+  "defaults": {"integer": {"allow_numeric_string": false, "allow_integral_double": true, "reject_unsafe_double": true}},
+  "runtime": {"max_depth": 64},
+  "collections": [
+    {"scope": {"collection": "cmn_activity_m"}, "root": {"target_type": "object", "properties": {
+      "add_amount": {"target_type": "int"}
+    }}},
+    {"scope": {"collection": "cmn_coupon_m"}, "root": {"target_type": "object", "properties": {
+      "expiration_date": {"target_type": "long"}
+    }}},
+    {"scope": {"collection": "ec_qrcode_benefits_code"}, "root": {"target_type": "object", "properties": {
+      "event_type": {"target_type": "int"},
+      "inventory": {"target_type": "int"},
+      "seqno": {"target_type": "int"}
+    }}},
+    {"scope": {"collection": "ec_qrcode_benefits_codemapping"}, "root": {"target_type": "object", "properties": {}}},
+    {"scope": {"collection": "ec_qrcode_benefits_main"}, "root": {"target_type": "object", "properties": {
+      "add_amount": {"target_type": "int"},
+      "event_type": {"target_type": "int"},
+      "gift_type": {"target_type": "int"},
+      "no_type": {"target_type": "int"}
+    }}},
+    {"scope": {"collection": "egtc_traded_m"}, "root": {"target_type": "object", "properties": {
+      "expiration_date": {"target_type": "long"},
+      "seqno": {"target_type": "int", "allow_numeric_string": true}
+    }}},
+    {"scope": {"collection": "event_record_main"}, "root": {"target_type": "object", "properties": {
+      "add_amount": {"target_type": "int"},
+      "daily_restriction_amount": {"target_type": "int"},
+      "event_sort": {"target_type": "int"},
+      "gift_inventory": {"target_type": "int"},
+      "gift_sort": {"target_type": "int"},
+      "inventory": {"target_type": "int"},
+      "no_type": {"target_type": "int"},
+      "order_barcode_type": {"target_type": "int"},
+      "run_type": {"target_type": "int"},
+      "show_type": {"target_type": "int"},
+      "sort": {"target_type": "int"},
+      "user_gift_limit": {"target_type": "int"},
+      "user_gift_limit_daily": {"target_type": "int"}
+    }}},
+    {"scope": {"collection": "event_record_traded_m"}, "root": {"target_type": "object", "properties": {
+      "expiration_date": {"target_type": "long"},
+      "seqno": {"target_type": "int", "allow_numeric_string": true}
+    }}},
+    {"scope": {"collection": "external_import_traded_m"}, "root": {"target_type": "object", "properties": {
+      "expiration_date": {"target_type": "long"},
+      "seqno": {"target_type": "int", "allow_numeric_string": true}
+    }}},
+    {"scope": {"collection": "imm_traded_m"}, "root": {"target_type": "object", "properties": {
+      "expiration_date": {"target_type": "long"},
+      "seqno": {"target_type": "int", "allow_numeric_string": true}
+    }}},
+    {"scope": {"collection": "inapp_notice_m"}, "root": {"target_type": "object", "properties": {
+      "expiration_date": {"target_type": "long"}
+    }}},
+    {"scope": {"collection": "inside_link_m"}, "root": {"target_type": "object", "properties": {
+      "expiration_date": {"target_type": "long"}
+    }}},
+    {"scope": {"collection": "itc_coupon_m"}, "root": {"target_type": "object", "properties": {
+      "expiration_date": {"target_type": "long"}
+    }}},
+    {"scope": {"collection": "member_benefits_m"}, "root": {"target_type": "object", "properties": {
+      "add_amount": {"target_type": "int"},
+      "event_type": {"target_type": "int"}
+    }}},
+    {"scope": {"collection": "mms_coupon_m"}, "root": {"target_type": "object", "properties": {
+      "seqno": {"target_type": "int", "allow_numeric_string": true}
+    }}},
+    {"scope": {"collection": "mms_event_record"}, "root": {"target_type": "object", "properties": {
+      "add_amount": {"target_type": "int"},
+      "no_type": {"target_type": "int"}
+    }}},
+    {"scope": {"collection": "my_notice_m"}, "root": {"target_type": "object", "properties": {
+      "expiration_date": {"target_type": "long"}
+    }}},
+    {"scope": {"collection": "pos_activity_m"}, "root": {"target_type": "object", "properties": {
+      "add_amount": {"target_type": "int"}
+    }}},
+    {"scope": {"collection": "pos_coupon_m"}, "root": {"target_type": "object", "properties": {
+      "expiration_date": {"target_type": "long"}
+    }}},
+    {"scope": {"collection": "s_feature"}, "root": {"target_type": "object", "properties": {}}},
+    {"scope": {"collection": "s_vender_business_config"}, "root": {"target_type": "object", "properties": {
+      "expiration_day": {"target_type": "int"}
+    }}},
+    {"scope": {"collection": "user_account_m"}, "root": {"target_type": "object", "properties": {
+      "aid": {"target_type": "int"}
+    }}},
+    {"scope": {"collection": "user_def_payment"}, "root": {"target_type": "object", "properties": {}}}
+  ]
+}
